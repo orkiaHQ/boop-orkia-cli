@@ -1,6 +1,6 @@
 //! Forge-neutral review projection planning.
 
-use orkia_model::{ForgeReview, OrkiaError, Result, ReviewPlan, ReviewUnitId};
+use orkia_model::{ForgeReview, OrkiaError, Result, ReviewPlan};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub fn projections(plan: &ReviewPlan, base_branch: &str) -> Result<Vec<ForgeReview>> {

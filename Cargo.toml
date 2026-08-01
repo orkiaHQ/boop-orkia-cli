@@ -44,7 +44,6 @@ url = { version = "2.5", features = ["serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
-missing_docs = "warn"
 
 [profile.release]
 lto = "thin"
