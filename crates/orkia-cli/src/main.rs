@@ -803,6 +803,7 @@ fn record_agent_hook(
             &external_session,
             &session,
             &hook_event,
+            repository,
         )?;
         let events = git.ledger_store().read_all()?;
         let policy = load_repository_policy(repository)?;
@@ -928,6 +929,7 @@ fn record_agent_snapshot(
     external_session: &str,
     session: &SessionId,
     hook_event: &str,
+    repository: &Path,
 ) -> Result<orkia_model::LedgerEvent> {
     let events = git.ledger_store().read_all()?;
     let base_commit = session_base(&events, session)?;
@@ -936,10 +938,12 @@ fn record_agent_snapshot(
         .into_iter()
         .map(|change| change.path)
         .collect::<BTreeSet<_>>();
-    let observed_paths = observed_agent_paths(&events, session);
-    let unknown_write = changed_paths
-        .iter()
-        .any(|path| !observed_paths.contains(path));
+    let observed_paths = observed_agent_paths(&events, session, repository);
+    let unknown_write = changed_paths.iter().any(|path| {
+        !observed_paths
+            .iter()
+            .any(|observed| repository_path_matches(observed, path))
+    });
     ledger.append(CaptureEvent::FilesObserved {
         read: BTreeSet::new(),
         modified: changed_paths.clone(),
@@ -997,6 +1001,7 @@ fn session_repository(
 fn observed_agent_paths(
     events: &[orkia_model::LedgerEvent],
     session: &SessionId,
+    repository: &Path,
 ) -> BTreeSet<String> {
     events
         .iter()
@@ -1005,7 +1010,7 @@ fn observed_agent_paths(
                 session: Some(recorded_session),
                 action: orkia_model::AgentActionKind::FileWrite { path, .. },
                 ..
-            } if recorded_session == session => Some(path.clone()),
+            } if recorded_session == session => Some(relative_repository_path(repository, path)),
             _ => None,
         })
         .collect()
@@ -2590,7 +2595,11 @@ fn causal_coverage_milli(
             _ => BTreeSet::new(),
         })
         .collect::<BTreeSet<_>>();
-    let every_change_observed = changes.iter().all(|change| observed.contains(&change.path));
+    let every_change_observed = changes.iter().all(|change| {
+        observed
+            .iter()
+            .any(|candidate| repository_path_matches(candidate, &change.path))
+    });
     // A watcher may report a write before `orkia run` records the command
     // that mediated it. Treat the path as unknown until a later typed
     // observation closes it; an unrelated human/editor write remains a hard
@@ -2629,9 +2638,6 @@ fn causal_coverage_milli(
 /// back to the whole session remains the conservative behavior only when no
 /// provider exposed a path for that file.
 fn event_covers_path(event: &CaptureEvent, path: &str) -> bool {
-    fn matches_path(candidate: &str, path: &str) -> bool {
-        candidate == path || candidate.ends_with(&format!("/{path}"))
-    }
     match event {
         CaptureEvent::AgentAction {
             action:
@@ -2642,11 +2648,11 @@ fn event_covers_path(event: &CaptureEvent, path: &str) -> bool {
                     path: candidate, ..
                 },
             ..
-        } => matches_path(candidate, path),
+        } => repository_path_matches(candidate, path),
         CaptureEvent::FilesObserved { read, modified, .. } => read
             .iter()
             .chain(modified.iter())
-            .any(|candidate| matches_path(candidate, path)),
+            .any(|candidate| repository_path_matches(candidate, path)),
         CaptureEvent::AgentSessionSnapshot {
             changed_paths,
             observed_paths,
@@ -2654,9 +2660,28 @@ fn event_covers_path(event: &CaptureEvent, path: &str) -> bool {
         } => changed_paths
             .iter()
             .chain(observed_paths.iter())
-            .any(|candidate| matches_path(candidate, path)),
+            .any(|candidate| repository_path_matches(candidate, path)),
         _ => false,
     }
+}
+
+fn relative_repository_path(repository: &Path, candidate: &str) -> String {
+    let candidate_path = Path::new(candidate);
+    candidate_path
+        .strip_prefix(repository)
+        .unwrap_or(candidate_path)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_owned()
+}
+
+fn repository_path_matches(candidate: &str, path: &str) -> bool {
+    let candidate = candidate.replace('\\', "/");
+    let path = path.replace('\\', "/");
+    candidate == path
+        || candidate.trim_start_matches("./") == path.trim_start_matches("./")
+        || candidate.ends_with(&format!("/{path}"))
 }
 
 fn run_validations(
@@ -3453,5 +3478,16 @@ revoked_grants = []
         );
         let actors = BTreeMap::from([(identity.actor().id.clone(), identity.actor().clone())]);
         verify_chain(&events, &actors).unwrap();
+    }
+
+    #[test]
+    fn absolute_agent_paths_match_git_relative_paths() {
+        let repository = Path::new("/tmp/orkia-repository");
+        let absolute = "/tmp/orkia-repository/src/lib.rs";
+
+        assert_eq!(relative_repository_path(repository, absolute), "src/lib.rs");
+        assert!(repository_path_matches(absolute, "src/lib.rs"));
+        assert!(repository_path_matches("./src/lib.rs", "src/lib.rs"));
+        assert!(!repository_path_matches(absolute, "src/main.rs"));
     }
 }
