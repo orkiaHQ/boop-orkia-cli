@@ -1,11 +1,12 @@
 //! Inward-facing contracts. Implementations belong to infrastructure crates.
 
 use orkia_model::{
-    AccessGrant, Attestation, ForgeReview, GrantRevocation, Intent, KeyRotation, LedgerEvent,
-    Memory, MergeResolution, Organization, RepositoryPolicy, Result, ReviewPlan,
-    SemanticObjectKind, SemanticObjectRef, SemanticOperation, SemanticSignature, SemanticState,
-    Team, ValidationResult, VaultEntry, ViewMetadata,
+    AccessGrant, Attestation, ChangeSet, ForgeReview, GrantRevocation, Intent, KeyRotation,
+    LedgerEvent, Memory, MergeResolution, Organization, Projection, RepositoryPolicy, Result,
+    ReviewPlan, SemanticObjectKind, SemanticObjectRef, SemanticOperation, SemanticSignature,
+    SemanticState, Stack, StackPullRequest, Team, ValidationResult, VaultEntry, ViewMetadata,
 };
+use std::collections::{BTreeMap, BTreeSet};
 
 pub trait LedgerStore: Send + Sync {
     fn append(&self, event: &LedgerEvent) -> Result<()>;
@@ -57,6 +58,14 @@ pub trait SemanticDocumentStore: SemanticObjectStore {
     fn get_key_rotation(&self, object: &SemanticObjectRef) -> Result<KeyRotation>;
     fn put_signature(&self, signature: &SemanticSignature) -> Result<SemanticObjectRef>;
     fn get_signature(&self, object: &SemanticObjectRef) -> Result<SemanticSignature>;
+    fn put_stack_pull_request(&self, pull_request: &StackPullRequest) -> Result<SemanticObjectRef>;
+    fn get_stack_pull_request(&self, object: &SemanticObjectRef) -> Result<StackPullRequest>;
+    fn put_changeset(&self, changeset: &ChangeSet) -> Result<SemanticObjectRef>;
+    fn get_changeset(&self, object: &SemanticObjectRef) -> Result<ChangeSet>;
+    fn put_stack(&self, stack: &Stack) -> Result<SemanticObjectRef>;
+    fn get_stack(&self, object: &SemanticObjectRef) -> Result<Stack>;
+    fn put_projection(&self, projection: &Projection) -> Result<SemanticObjectRef>;
+    fn get_projection(&self, object: &SemanticObjectRef) -> Result<Projection>;
     fn activate_state(
         &self,
         commit: &str,
@@ -72,9 +81,38 @@ pub trait GitRepository: Send + Sync {
     fn read_ledger(&self) -> Result<Option<Vec<u8>>>;
 }
 
+/// Minimal Git content capability needed by the projection use case. The
+/// caller supplies already-validated patches; this adapter never chooses
+/// StackPullRequest boundaries or resolves semantic conflicts.
+pub trait PatchProjectionRepository: Send + Sync {
+    fn read_files_at(
+        &self,
+        commit: &str,
+        paths: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, String>>;
+    fn commit_file_contents(
+        &self,
+        branch: &str,
+        parent: &str,
+        files: &BTreeMap<String, String>,
+    ) -> Result<String>;
+}
+
 pub trait Forge: Send + Sync {
     fn publish(&self, review: &ForgeReview) -> Result<String>;
-    fn set_required_checks(&self, branch: &str, checks: &[String]) -> Result<()>;
+    /// Configures the forge protection that makes the signed Orkia policy
+    /// enforceable outside the CLI. Both the check contexts and the approval
+    /// quorum come from the repository policy; an adapter must not choose a
+    /// weaker default.
+    fn set_required_checks(
+        &self,
+        branch: &str,
+        checks: &[String],
+        required_approvals: u8,
+    ) -> Result<()>;
+    /// Publishes a completed check tied to the exact projected commit. The
+    /// caller supplies the policy result; forge adapters never decide it.
+    fn publish_check(&self, commit: &str, name: &str, passed: bool, summary: &str) -> Result<()>;
 }
 
 pub trait ReviewIndex: Send + Sync {
@@ -88,7 +126,7 @@ pub trait SecretStore: Send + Sync {
 }
 
 pub trait Clock: Send + Sync {
-    fn now(&self) -> time::OffsetDateTime;
+    fn now(&self) -> orkia_model::Timestamp;
 }
 
 pub trait ValidationExecutor: Send + Sync {

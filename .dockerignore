@@ -1,0 +1,16 @@
+# Build output and VCS data are not runtime inputs.  Excluding them makes
+# self-hosted server builds reproducible and prevents a local build cache from
+# being copied into the image context.
+target/
+.git/
+
+# Local state and editor artefacts must never reach a server image.
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.sqlite
+*.sqlite3
+*.db
+.env
+.env.*

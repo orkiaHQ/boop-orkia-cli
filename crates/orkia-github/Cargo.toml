@@ -3,17 +3,24 @@ name = "orkia-github"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 hex.workspace = true
 hmac.workspace = true
+jsonwebtoken.workspace = true
 orkia-model = { path = "../orkia-model" }
 orkia-ports = { path = "../orkia-ports" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+time.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+rand_core.workspace = true
+rsa = "0.9"
 
 [lints]
 workspace = true

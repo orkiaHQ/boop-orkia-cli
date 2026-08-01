@@ -9,6 +9,9 @@ use uuid::Uuid;
 
 pub type Hash = String;
 pub type CanonicalJson = Vec<u8>;
+/// Domain-owned timestamp type used by ports so infrastructure contracts do
+/// not need to depend directly on the serialization/runtime crate.
+pub type Timestamp = OffsetDateTime;
 pub const SEMANTIC_SCHEMA_VERSION: u16 = 1;
 
 /// RFC-8785-style deterministic JSON for Orkia's signed documents. Object
@@ -93,6 +96,10 @@ pub enum SemanticObjectKind {
     Memory,
     KeyRotation,
     GrantRevocation,
+    StackPullRequest,
+    ChangeSet,
+    Stack,
+    Projection,
 }
 
 impl SemanticObjectKind {
@@ -114,6 +121,10 @@ impl SemanticObjectKind {
             Self::Memory => "memory",
             Self::KeyRotation => "key_rotation",
             Self::GrantRevocation => "grant_revocation",
+            Self::StackPullRequest => "stack-pr",
+            Self::ChangeSet => "changeset",
+            Self::Stack => "stack",
+            Self::Projection => "projection",
         }
     }
 }
@@ -869,6 +880,92 @@ id!(EventId);
 id!(ReviewUnitId);
 id!(PlanId);
 id!(RepositoryId);
+id!(StackPullRequestId);
+id!(ChangeSetId);
+id!(StackId);
+id!(ProjectionId);
+
+impl StackPullRequestId {
+    /// Deterministic identity for an automatically derived causal work unit.
+    /// Session identity and its closed atom set are durable across projection
+    /// rewrites, unlike a Git commit hash.
+    pub fn from_stable_parts(parts: &[&[u8]]) -> Self {
+        let mut hasher = Sha256::new();
+        for part in parts {
+            hasher.update((part.len() as u64).to_be_bytes());
+            hasher.update(part);
+        }
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x50;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Self(Uuid::from_bytes(bytes))
+    }
+}
+
+impl StackId {
+    /// Stable identity for the stack represented by a closed set of
+    /// stack PRs. Revisions then model changes in its projection or policy,
+    /// rather than inventing a new stack for the same causal graph.
+    pub fn from_stack_pull_requests(
+        pull_requests: impl IntoIterator<Item = StackPullRequestId>,
+    ) -> Self {
+        let mut ids = pull_requests.into_iter().collect::<Vec<_>>();
+        ids.sort();
+        let mut hasher = Sha256::new();
+        hasher.update(b"orkia:stack:v1");
+        for id in ids {
+            hasher.update(id.0.as_bytes());
+        }
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x50;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Self(Uuid::from_bytes(bytes))
+    }
+}
+
+impl ChangeSetId {
+    /// A ChangeSet is the durable multi-repository delivery group. Its stable
+    /// identity derives from both the repository and stack identities. A
+    /// StackId alone is only locally meaningful, so omitting its repository
+    /// could collide across independent repositories.
+    pub fn from_stack_references(stacks: impl IntoIterator<Item = ChangeSetStack>) -> Self {
+        let mut references = stacks.into_iter().collect::<Vec<_>>();
+        references.sort();
+        let mut hasher = Sha256::new();
+        hasher.update(b"orkia:changeset:v1");
+        for reference in references {
+            hasher.update(reference.repository.0.as_bytes());
+            hasher.update(reference.stack.0.as_bytes());
+        }
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x50;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Self(Uuid::from_bytes(bytes))
+    }
+}
+
+impl ProjectionId {
+    /// A StackPullRequest has one durable projection identity per repository. New
+    /// restack attempts become revisions of this projection rather than new
+    /// review objects.
+    pub fn from_stack_pull_request(pull_request: &StackPullRequestId) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"orkia:projection:v1");
+        hasher.update(pull_request.0.as_bytes());
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x50;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Self(Uuid::from_bytes(bytes))
+    }
+}
 
 /// Identifier for an extracted review atom.
 ///
@@ -1051,6 +1148,15 @@ pub enum CaptureEvent {
         session: Option<SessionId>,
         action: AgentActionKind,
     },
+    /// Authenticated forge delivery retained in the signed ledger before any
+    /// webhook-specific orchestration consumes it. The payload is lossless so
+    /// a later server version can replay new GitHub event fields.
+    ForgeWebhook {
+        forge: String,
+        event_name: String,
+        delivery_id: String,
+        payload: serde_json::Value,
+    },
     FilesObserved {
         read: BTreeSet<String>,
         modified: BTreeSet<String>,
@@ -1081,6 +1187,46 @@ pub enum CaptureEvent {
     ReviewPlanRevised {
         plan: PlanId,
         revision: u32,
+        reason: String,
+    },
+    ReviewPlanApproved {
+        plan: PlanId,
+        revision: u32,
+    },
+    ReviewPlanChangesRequested {
+        plan: PlanId,
+        revision: u32,
+        reason: String,
+    },
+    StackPullRequestPublished {
+        pull_request: StackPullRequestId,
+        revision: u32,
+        object: SemanticObjectRef,
+    },
+    ChangeSetPublished {
+        changeset: ChangeSetId,
+        revision: u32,
+        object: SemanticObjectRef,
+    },
+    ChangeSetIntegrated {
+        changeset: ChangeSetId,
+        revision: u32,
+    },
+    ProjectionUpdated {
+        projection: ProjectionId,
+        pull_request: StackPullRequestId,
+        revision: u32,
+        commit: Option<String>,
+    },
+    /// Signed result of the final policy gate. The causal ledger records the
+    /// decision independently of mutable forge state, whether the gate
+    /// passed or failed.
+    IntegrationEvaluated {
+        plan: Option<PlanId>,
+        changeset: Option<ChangeSetId>,
+        branch: String,
+        approvals: u8,
+        passed: bool,
         reason: String,
     },
     SessionClosed {
@@ -1144,6 +1290,32 @@ pub struct ChangeAtom {
     pub source_events: BTreeSet<EventId>,
 }
 
+/// Pure representation of a Git tree-to-worktree change. Infrastructure
+/// adapters populate it; semantic and StackPullRequest crates can consume it without
+/// depending on libgit2.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    pub old_content: String,
+    pub new_content: String,
+    pub changed_start: u32,
+    pub changed_end: u32,
+}
+
+/// An exact, context-bound fragment projected for a StackPullRequest. `before` is
+/// matched against the parent projection; empty `before` represents an
+/// insertion and is anchored by the neighbouring contexts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PatchFragment {
+    pub atoms: BTreeSet<AtomId>,
+    pub path: String,
+    pub before: String,
+    pub after: String,
+    pub before_context: String,
+    pub after_context: String,
+    pub base_content_hash: Hash,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DependencyKind {
     Hard,
@@ -1185,6 +1357,11 @@ pub struct ReviewPlan {
     pub id: PlanId,
     pub revision: u32,
     pub source_checkpoint: String,
+    /// Digest of the exact repository policy evaluated to create this plan.
+    /// It is part of the signed plan bytes, so a later policy change cannot be
+    /// silently applied to an earlier causal decision.
+    #[serde(default)]
+    pub policy_digest: Option<Hash>,
     pub units: Vec<ReviewUnit>,
     #[serde(default)]
     pub atom_paths: BTreeMap<AtomId, String>,
@@ -1204,6 +1381,13 @@ impl SemanticDocument for ReviewPlan {
     fn validate(&self) -> Result<()> {
         validate_schema_version(self.schema_version)?;
         validate_hash(&self.source_checkpoint, "review plan checkpoint")?;
+        if let Some(digest) = &self.policy_digest
+            && (digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(OrkiaError::Invalid(
+                "review plan policy digest must be a SHA-256 hexadecimal value".into(),
+            ));
+        }
         if self.coverage_milli > 1000 {
             return Err(OrkiaError::Invalid(
                 "review plan coverage cannot exceed 1000‰".into(),
@@ -1222,6 +1406,84 @@ impl SemanticDocument for ReviewPlan {
                 ));
             }
         }
+        // New semantic plans must be closed over their concrete atoms. Empty
+        // `atoms` remains readable for the legacy plan format, but once an
+        // atom manifest is present no unit may invent, duplicate or omit an
+        // atom and the path index must describe that same manifest.
+        if !self.atoms.is_empty() {
+            let atom_ids = self
+                .atoms
+                .iter()
+                .map(|atom| atom.id.clone())
+                .collect::<BTreeSet<_>>();
+            if atom_ids.len() != self.atoms.len() {
+                return Err(OrkiaError::Invalid(
+                    "review plan atom manifest contains duplicate IDs".into(),
+                ));
+            }
+            let mut assigned = BTreeSet::new();
+            for unit in &self.units {
+                for atom in &unit.atoms {
+                    if !atom_ids.contains(atom) || !assigned.insert(atom.clone()) {
+                        return Err(OrkiaError::Invalid(
+                            "review plan units must partition the atom manifest".into(),
+                        ));
+                    }
+                }
+            }
+            if assigned != atom_ids {
+                return Err(OrkiaError::Invalid(
+                    "review plan units must cover every atom in the manifest".into(),
+                ));
+            }
+            if !self.atom_paths.is_empty()
+                && self.atom_paths.keys().cloned().collect::<BTreeSet<_>>() != atom_ids
+            {
+                return Err(OrkiaError::Invalid(
+                    "review plan atom paths must match the atom manifest".into(),
+                ));
+            }
+        }
+        // Dependencies are part of the signed review decision, so reject
+        // dangling edges and cycles before a projection adapter can consume
+        // the plan.
+        for unit in &self.units {
+            if unit.depends_on.contains(&unit.id)
+                || unit
+                    .depends_on
+                    .iter()
+                    .any(|dependency| !ids.contains(dependency))
+            {
+                return Err(OrkiaError::Invalid(
+                    "review plan dependencies must be closed and acyclic".into(),
+                ));
+            }
+        }
+        let mut remaining = ids.clone();
+        let mut complete = BTreeSet::new();
+        while !remaining.is_empty() {
+            let ready = self
+                .units
+                .iter()
+                .filter(|unit| {
+                    remaining.contains(&unit.id)
+                        && unit
+                            .depends_on
+                            .iter()
+                            .all(|dependency| complete.contains(dependency))
+                })
+                .map(|unit| unit.id.clone())
+                .collect::<Vec<_>>();
+            if ready.is_empty() {
+                return Err(OrkiaError::Invalid(
+                    "review plan dependencies must be acyclic".into(),
+                ));
+            }
+            for id in ready {
+                remaining.remove(&id);
+                complete.insert(id);
+            }
+        }
         Ok(())
     }
 }
@@ -1233,6 +1495,10 @@ pub struct RepositoryPolicy {
     pub minimum_coverage_milli: u16,
     pub minimum_confidence_milli: u16,
     pub required_approvals: u8,
+    /// GitHub check contexts required on protected branches. The default
+    /// makes `orkia integrate` enforceable outside the CLI as well.
+    #[serde(default = "default_required_checks")]
+    pub required_checks: BTreeSet<String>,
     #[serde(default = "default_minimum_semantic_signatures")]
     pub minimum_semantic_signatures: u8,
     #[serde(default)]
@@ -1243,6 +1509,10 @@ pub struct RepositoryPolicy {
 
 const fn default_minimum_semantic_signatures() -> u8 {
     1
+}
+
+fn default_required_checks() -> BTreeSet<String> {
+    BTreeSet::from(["orkia/integrate".into()])
 }
 
 const fn default_semantic_schema_version() -> u16 {
@@ -1257,11 +1527,20 @@ impl Default for RepositoryPolicy {
             minimum_coverage_milli: 950,
             minimum_confidence_milli: 800,
             required_approvals: 1,
+            required_checks: default_required_checks(),
             minimum_semantic_signatures: default_minimum_semantic_signatures(),
             authorized_grant_issuers: BTreeSet::new(),
             revoked_grants: BTreeSet::new(),
         }
     }
+}
+
+/// Stable SHA-256 digest of the policy semantics, not its TOML formatting.
+/// The resulting value is embedded in a signed `ReviewPlan` by the CLI before
+/// it can influence projection or integration.
+pub fn repository_policy_digest(policy: &RepositoryPolicy) -> Result<Hash> {
+    let bytes = canonical_json(policy)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1271,9 +1550,346 @@ pub struct ValidationResult {
     pub output: String,
 }
 
+/// Lifecycle of a causal unit of work.  A revision creates a new immutable
+/// object; this state describes the current semantic meaning, never a mutable
+/// Git branch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StackPullRequestStatus {
+    Proposed,
+    Active,
+    Superseded,
+    Integrated,
+    Abandoned,
+    BlockedConflict,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct StackPullRequestDependency {
+    pub stack_pull_request: StackPullRequestId,
+    pub repository: RepositoryId,
+}
+
+/// Immutable, signed causal work unit.  Its ID never includes a projected Git
+/// commit, so rebase/restack can replace the projection without losing review
+/// history or agent provenance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StackPullRequest {
+    #[serde(default = "default_semantic_schema_version")]
+    pub schema_version: u16,
+    pub id: StackPullRequestId,
+    pub revision: u32,
+    #[serde(default)]
+    pub source_plan: Option<PlanId>,
+    /// Immutable revision of `source_plan` that selected these exact
+    /// StackPullRequest boundaries. A reviewer correction therefore cannot make a
+    /// later projection accidentally mix units from an older plan revision.
+    #[serde(default)]
+    pub source_plan_revision: u32,
+    pub session: SessionId,
+    #[serde(default)]
+    pub intent: Option<SemanticObjectRef>,
+    pub repository: RepositoryId,
+    pub base_commit: Hash,
+    #[serde(default)]
+    pub parents: BTreeSet<StackPullRequestId>,
+    #[serde(default)]
+    pub dependencies: BTreeSet<StackPullRequestDependency>,
+    pub atoms: Vec<ChangeAtom>,
+    #[serde(default)]
+    pub patches: Vec<PatchFragment>,
+    pub evidence: BTreeSet<EventId>,
+    #[serde(default)]
+    pub validations: Vec<ValidationResult>,
+    pub status: StackPullRequestStatus,
+    #[serde(default)]
+    pub supersedes: Option<SemanticObjectRef>,
+}
+
+impl SemanticDocument for StackPullRequest {
+    const KIND: SemanticObjectKind = SemanticObjectKind::StackPullRequest;
+
+    fn validate(&self) -> Result<()> {
+        validate_schema_version(self.schema_version)?;
+        validate_hash(&self.base_commit, "stack pull request base commit")?;
+        if self.atoms.is_empty() || self.evidence.is_empty() {
+            return Err(OrkiaError::Invalid(
+                "a stack pull request needs atoms and captured causal evidence".into(),
+            ));
+        }
+        if let Some(intent) = &self.intent {
+            if intent.kind != SemanticObjectKind::Intent {
+                return Err(OrkiaError::Invalid(
+                    "stack pull request intent must be an intent object".into(),
+                ));
+            }
+            validate_object_ref(intent, "stack pull request intent")?;
+        }
+        if let Some(previous) = &self.supersedes {
+            if previous.kind != SemanticObjectKind::StackPullRequest {
+                return Err(OrkiaError::Invalid(
+                    "stack pull request supersedes must reference a stack pull request".into(),
+                ));
+            }
+            validate_object_ref(previous, "stack pull request supersedes")?;
+        }
+        let mut atom_ids = BTreeSet::new();
+        for atom in &self.atoms {
+            if !atom_ids.insert(atom.id.clone()) {
+                return Err(OrkiaError::Invalid(
+                    "stack pull request contains duplicate atoms".into(),
+                ));
+            }
+            if atom.source_events.is_empty()
+                || !atom
+                    .source_events
+                    .iter()
+                    .all(|event| self.evidence.contains(event))
+            {
+                return Err(OrkiaError::Invalid(
+                    "every stack pull request atom must close over captured evidence".into(),
+                ));
+            }
+        }
+        for patch in &self.patches {
+            if patch.path.is_empty()
+                || patch.atoms.is_empty()
+                || !patch.atoms.iter().all(|atom| atom_ids.contains(atom))
+                || patch.base_content_hash.is_empty()
+            {
+                return Err(OrkiaError::Invalid(
+                    "stack pull request patch must be closed over its atoms and base content"
+                        .into(),
+                ));
+            }
+        }
+        if self.parents.contains(&self.id)
+            || self
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.stack_pull_request == self.id)
+        {
+            return Err(OrkiaError::Invalid(
+                "stack pull request cannot depend on itself".into(),
+            ));
+        }
+        if self
+            .dependencies
+            .iter()
+            .any(|dependency| dependency.repository == self.repository)
+        {
+            return Err(OrkiaError::Invalid(
+                "cross-repository dependencies must reference another repository".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionStatus {
+    Pending,
+    Projected,
+    Published,
+    BlockedConflict,
+    Superseded,
+}
+
+/// Replaceable Git/forge manifestation of a durable StackPullRequest.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Projection {
+    #[serde(default = "default_semantic_schema_version")]
+    pub schema_version: u16,
+    pub id: ProjectionId,
+    pub revision: u32,
+    pub stack_pull_request: StackPullRequestId,
+    /// Exact immutable StackPullRequest revision materialized by this
+    /// projection. The stable ID alone is insufficient after a restack.
+    #[serde(default)]
+    pub stack_pull_request_revision: u32,
+    pub repository: RepositoryId,
+    pub branch: String,
+    pub base_branch: String,
+    pub base_commit: Hash,
+    #[serde(default)]
+    pub commit: Option<Hash>,
+    #[serde(default)]
+    pub forge_pull_request: Option<String>,
+    pub status: ProjectionStatus,
+    #[serde(default)]
+    pub supersedes: Option<SemanticObjectRef>,
+}
+
+impl SemanticDocument for Projection {
+    const KIND: SemanticObjectKind = SemanticObjectKind::Projection;
+
+    fn validate(&self) -> Result<()> {
+        validate_schema_version(self.schema_version)?;
+        validate_hash(&self.base_commit, "projection base commit")?;
+        if self.branch.is_empty() || self.base_branch.is_empty() {
+            return Err(OrkiaError::Invalid(
+                "projection branches cannot be empty".into(),
+            ));
+        }
+        if let Some(commit) = &self.commit {
+            validate_hash(commit, "projection commit")?;
+        }
+        if matches!(
+            self.status,
+            ProjectionStatus::Projected | ProjectionStatus::Published
+        ) && self.commit.is_none()
+        {
+            return Err(OrkiaError::Invalid(
+                "a projected projection must name its immutable Git commit".into(),
+            ));
+        }
+        if matches!(self.status, ProjectionStatus::Published)
+            && self.forge_pull_request.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(OrkiaError::Invalid(
+                "a published projection must name its forge pull request".into(),
+            ));
+        }
+        if let Some(previous) = &self.supersedes {
+            if previous.kind != SemanticObjectKind::Projection {
+                return Err(OrkiaError::Invalid(
+                    "projection supersedes must reference a projection".into(),
+                ));
+            }
+            validate_object_ref(previous, "projection supersedes")?;
+        }
+        Ok(())
+    }
+}
+
+/// Ordered PR stack inside exactly one repository. The PR records carry
+/// patches and projections; this object records their Git/forge order.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Stack {
+    #[serde(default = "default_semantic_schema_version")]
+    pub schema_version: u16,
+    pub id: StackId,
+    pub revision: u32,
+    pub repository: RepositoryId,
+    pub pull_requests: BTreeSet<StackPullRequestId>,
+    /// Immutable member selection for this Stack revision. Looking up the
+    /// latest StackPullRequest by ID would silently rewrite historical review
+    /// meaning after an amend, so every member revision is recorded here.
+    #[serde(default)]
+    pub pull_request_revisions: BTreeMap<StackPullRequestId, u32>,
+    #[serde(default)]
+    pub roots: BTreeSet<StackPullRequestId>,
+    #[serde(default)]
+    pub supersedes: Option<SemanticObjectRef>,
+}
+
+impl SemanticDocument for Stack {
+    const KIND: SemanticObjectKind = SemanticObjectKind::Stack;
+
+    fn validate(&self) -> Result<()> {
+        validate_schema_version(self.schema_version)?;
+        if self.pull_requests.is_empty() || !self.roots.is_subset(&self.pull_requests) {
+            return Err(OrkiaError::Invalid(
+                "a stack needs stack PRs and roots contained in that stack".into(),
+            ));
+        }
+        if !self.pull_request_revisions.is_empty()
+            && self
+                .pull_request_revisions
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                != self.pull_requests
+        {
+            return Err(OrkiaError::Invalid(
+                "a stack revision must select exactly one revision for every stack pull request"
+                    .into(),
+            ));
+        }
+        if let Some(previous) = &self.supersedes {
+            if previous.kind != SemanticObjectKind::Stack {
+                return Err(OrkiaError::Invalid(
+                    "stack supersedes must reference a stack".into(),
+                ));
+            }
+            validate_object_ref(previous, "stack supersedes")?;
+        }
+        Ok(())
+    }
+}
+
+/// Causal delivery spanning one or more repository-local stacks. This is the
+/// multi-repository unit used for coordinated publication and integration; it
+/// deliberately contains no Git patch because content remains in stack PRs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeSet {
+    #[serde(default = "default_semantic_schema_version")]
+    pub schema_version: u16,
+    pub id: ChangeSetId,
+    pub revision: u32,
+    pub stacks: BTreeSet<ChangeSetStack>,
+    #[serde(default)]
+    pub depends_on: BTreeSet<ChangeSetId>,
+    pub status: StackPullRequestStatus,
+    #[serde(default)]
+    pub supersedes: Option<SemanticObjectRef>,
+}
+
+/// A stack as seen by a multi-repository ChangeSet. The repository identity
+/// is part of the edge: a StackId alone cannot be used to schedule or verify
+/// a delivery across independent Git repositories.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct ChangeSetStack {
+    pub repository: RepositoryId,
+    pub stack: StackId,
+    /// The exact signed Stack revision coordinated by this ChangeSet.
+    #[serde(default)]
+    pub revision: u32,
+}
+
+impl SemanticDocument for ChangeSet {
+    const KIND: SemanticObjectKind = SemanticObjectKind::ChangeSet;
+
+    fn validate(&self) -> Result<()> {
+        validate_schema_version(self.schema_version)?;
+        if self.stacks.is_empty() || self.depends_on.contains(&self.id) {
+            return Err(OrkiaError::Invalid(
+                "a changeset needs stacks and cannot depend on itself".into(),
+            ));
+        }
+        let unique_stacks = self
+            .stacks
+            .iter()
+            .map(|reference| (reference.repository.clone(), reference.stack.clone()))
+            .collect::<BTreeSet<_>>();
+        if unique_stacks.len() != self.stacks.len() {
+            return Err(OrkiaError::Invalid(
+                "a changeset cannot select more than one revision of the same repository stack"
+                    .into(),
+            ));
+        }
+        if let Some(previous) = &self.supersedes {
+            if previous.kind != SemanticObjectKind::ChangeSet {
+                return Err(OrkiaError::Invalid(
+                    "changeset supersedes must reference a changeset".into(),
+                ));
+            }
+            validate_object_ref(previous, "changeset supersedes")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ForgeReview {
-    pub unit: ReviewUnitId,
+    /// Legacy review-plan unit, retained only for importing pre-stack plans.
+    #[serde(default)]
+    pub unit: Option<ReviewUnitId>,
+    /// Stable causal unit represented by this forge review. This identity
+    /// survives rebase, restack and replacement commits.
+    #[serde(default)]
+    pub pull_request: Option<StackPullRequestId>,
     pub branch: String,
     pub base: String,
     pub title: String,
@@ -1312,6 +1928,7 @@ pub fn event_kind(event: &CaptureEvent) -> &'static str {
         CaptureEvent::Prompt { .. } => "prompt",
         CaptureEvent::Transcript { .. } => "transcript",
         CaptureEvent::AgentAction { .. } => "agent_action",
+        CaptureEvent::ForgeWebhook { .. } => "forge_webhook",
         CaptureEvent::ToolCall { .. } => "tool_call",
         CaptureEvent::AgentHook { .. } => "agent_hook",
         CaptureEvent::AgentTranscript { .. } => "agent_transcript",
@@ -1323,6 +1940,13 @@ pub fn event_kind(event: &CaptureEvent) -> &'static str {
         CaptureEvent::Checkpoint { .. } => "checkpoint",
         CaptureEvent::ReviewPlanCreated { .. } => "review_plan_created",
         CaptureEvent::ReviewPlanRevised { .. } => "review_plan_revised",
+        CaptureEvent::ReviewPlanApproved { .. } => "review_plan_approved",
+        CaptureEvent::ReviewPlanChangesRequested { .. } => "review_plan_changes_requested",
+        CaptureEvent::StackPullRequestPublished { .. } => "stack_pull_request_published",
+        CaptureEvent::ChangeSetPublished { .. } => "changeset_published",
+        CaptureEvent::ChangeSetIntegrated { .. } => "changeset_integrated",
+        CaptureEvent::ProjectionUpdated { .. } => "projection_updated",
+        CaptureEvent::IntegrationEvaluated { .. } => "integration_evaluated",
         CaptureEvent::SessionClosed { .. } => "session_closed",
     }
 }
@@ -1394,6 +2018,7 @@ mod tests {
             id: PlanId::new(),
             revision: 0,
             source_checkpoint: "checkpoint".into(),
+            policy_digest: None,
             units: vec![ReviewUnit {
                 id: ReviewUnitId::new(),
                 title: "unit".into(),
@@ -1408,5 +2033,90 @@ mod tests {
             created_from: BTreeSet::new(),
         };
         assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn review_plan_rejects_atom_gaps_and_dependency_cycles() {
+        let first = ChangeAtom {
+            id: AtomId::new(),
+            kind: AtomKind::Symbol,
+            path: "src/lib.rs".into(),
+            symbol: Some("first".into()),
+            start_line: 1,
+            end_line: 1,
+            content_hash: "first".into(),
+            source_events: BTreeSet::new(),
+        };
+        let second = ChangeAtom {
+            id: AtomId::new(),
+            kind: AtomKind::Symbol,
+            path: "src/lib.rs".into(),
+            symbol: Some("second".into()),
+            start_line: 2,
+            end_line: 2,
+            content_hash: "second".into(),
+            source_events: BTreeSet::new(),
+        };
+        let first_unit = ReviewUnitId::new();
+        let second_unit = ReviewUnitId::new();
+        let plan = ReviewPlan {
+            schema_version: SEMANTIC_SCHEMA_VERSION,
+            id: PlanId::new(),
+            revision: 0,
+            source_checkpoint: "checkpoint".into(),
+            policy_digest: None,
+            units: vec![
+                ReviewUnit {
+                    id: first_unit.clone(),
+                    title: "first".into(),
+                    atoms: BTreeSet::from([first.id.clone()]),
+                    depends_on: BTreeSet::from([second_unit.clone()]),
+                    confidence_milli: 1000,
+                },
+                ReviewUnit {
+                    id: second_unit,
+                    title: "second".into(),
+                    atoms: BTreeSet::from([second.id.clone()]),
+                    depends_on: BTreeSet::from([first_unit]),
+                    confidence_milli: 1000,
+                },
+            ],
+            atoms: vec![first, second],
+            atom_paths: BTreeMap::new(),
+            coverage_milli: 1000,
+            status: PlanStatus::Proposed,
+            created_from: BTreeSet::new(),
+        };
+        assert!(plan.validate().is_err());
+    }
+
+    #[test]
+    fn policy_digest_is_canonical_and_changes_with_policy_semantics() {
+        let policy = RepositoryPolicy::default();
+        let first = repository_policy_digest(&policy).unwrap();
+        assert_eq!(first, repository_policy_digest(&policy).unwrap());
+        let mut changed = policy;
+        changed.required_approvals = 2;
+        assert_ne!(first, repository_policy_digest(&changed).unwrap());
+    }
+
+    #[test]
+    fn published_projection_requires_commit_and_forge_identity() {
+        let projection = Projection {
+            schema_version: SEMANTIC_SCHEMA_VERSION,
+            id: ProjectionId::new(),
+            revision: 0,
+            stack_pull_request: StackPullRequestId::new(),
+            stack_pull_request_revision: 0,
+            repository: RepositoryId::new(),
+            branch: "orkia/stack-pr/example".into(),
+            base_branch: "main".into(),
+            base_commit: "base".into(),
+            commit: None,
+            forge_pull_request: None,
+            status: ProjectionStatus::Published,
+            supersedes: None,
+        };
+        assert!(projection.validate().is_err());
     }
 }
