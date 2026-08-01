@@ -1,242 +1,180 @@
-# Feuille de route Orkia — sessions agent, ChangeSets et stacks Git
+# Feuille de route Orkia — sessions agent, stacks et ChangeSets Git-native
 
 > Révision produit : 1 août 2026.  
 > Inspiration de référence : Atomic, source disponible sous
-> `/Volumes/MyWorld/monkey.d.labs/coding/riftrHQ/_killix/inspiration_code/atomic`.  
-> Direction : Git reste l’autorité du contenu et du transport ; Orkia rend
-> persistantes l’intention, la causalité agent et l’orchestration des changesets.
+> `/Volumes/MyWorld/monkey.d.labs/coding/riftrHQ/_killix/inspiration_code/atomic`.
+
+## Vocabulaire canonique
+
+- Une **StackPullRequest** est une petite PR issue d’atomes et de fragments de
+  patch exacts. Elle a une seule base Git et sa propre branche de projection.
+- Un **Stack** est une grosse évolution découpée en plusieurs
+  StackPullRequests ordonnées dans un même dépôt.
+- Un **ChangeSet** est un groupe causal de stacks ou de PRs dépendantes,
+  potentiellement réparti sur plusieurs dépôts. Il coordonne publication et
+  intégration ; il ne porte jamais le contenu Git.
+
+Cette terminologie est un contrat de produit et de code. En particulier, un
+commit ou un diff Git n’est ni une StackPullRequest ni un ChangeSet : c’est une
+projection reproductible.
 
 ## Décision produit
 
-Le produit ne doit pas avoir le **diff Git** comme artefact principal. Son
-unité de travail est une **session agent** qui produit des preuves et un ou
-plusieurs **ChangeSets**. Les commits, branches, diffs et PRs sont les
-projections Git de ces ChangeSets.
+Git reste l’autorité pour blobs, trees, commits, branches, refs, packs et
+remotes. Orkia capture l’intention et la causalité, les signe, puis dérive les
+frontières de review à l’intérieur des checkpoints.
 
 ```text
 Session agent signée
-  └─ intention + tours + actions + lectures/écritures + validations
-       └─ ChangeSet DAG stable
-            ├─ projection mono-repo : branches et PRs empilées
-            └─ projection multi-repo : branches, PRs et dépendances coordonnées
+  └─ intention + actions + lectures/écritures + validations
+       └─ atomes et plan de review signé
+            └─ StackPullRequest DAG mono-repo
+                 └─ Stack ordonné
+                      └─ ChangeSet multi-repo (coordination seulement)
 ```
 
-Cette direction fournit deux expériences complémentaires :
+Une StackPullRequest parent est projetée sur une branche Git ; l’enfant utilise
+cette branche comme base. Lorsqu’un parent est révisé, les descendants sont
+reprojetés dans l’ordre topologique. Les dépendances entre dépôts sont des
+arêtes de ChangeSet et ne sont jamais déguisées en branche Git locale.
 
-- **Stack Graphite-like** : chaque ChangeSet est projeté sur une branche Git ;
-  la PR enfant cible la branche de son parent plutôt que `main`. Un changement
-  d’un parent déclenche le restack déterministe des descendants.
-- **Stack multi-repo** : un même DAG peut inclure des ChangeSets dans plusieurs
-  dépôts. Orkia crée et actualise les branches/PRs correspondantes et expose
-  leur état agrégé sans inventer un protocole de contenu concurrent à Git.
+## Atomic : inspiration, pas second moteur Git
 
-## Atomic : inspiration, pas dépendance de stockage
-
-Atomic reste essentiel : il donne les bonnes propriétés à préserver.
-
-| Inspiration Atomic | Traduction Orkia Git-native |
+| Propriété d’Atomic | Traduction Orkia Git-native |
 | --- | --- |
-| Identités de changement durables | `ChangeSetId` stable, indépendant des hashes de commits réécrits par rebase/restack. |
-| Graphe de dépendances | DAG signé de ChangeSets, parents explicites et fermeture vérifiée. |
-| Concurrence déterministe | Ordre canonique des ChangeSets/opérations, règles fail-closed et tests de convergence multi-clone. |
-| États vivant/supprimé/zombie | Tombstones dans les manifests sémantiques et ChangeSets supersédés, jamais effacés silencieusement. |
-| Provenance complète | Liens session → action → diff → ChangeSet → commit → PR → validation. |
-| Vues et isolation | Branches/worktrees Git et vues Orkia, pas un second espace de travail propriétaire. |
+| Causalité persistante | session → action → atome → StackPullRequest → projection → PR → validation signés |
+| Identité durable | les identités de StackPullRequest, Stack et ChangeSet ne dépendent pas d’un commit réécrit |
+| Graphe fermé | parents locaux de StackPullRequest et dépendances de ChangeSet vérifiés avant projection ou intégration |
+| Concurrence explicite | ordre déterministe, conflit ou preuve manquante bloquent ; aucune frontière n’est devinée |
+| Vues isolées | worktrees, branches et refs Git, sans espace de travail propriétaire |
 
-Orkia ne doit pas reproduire le stockage CRDT d’Atomic ni en faire une seconde
-source de vérité. Les blobs, trees, commits, branches, refs, packs et remotes
-Git restent autoritaires. Lorsqu’une décision sémantique ne peut pas être
-prouvée, Orkia retombe explicitement sur Git normal ; il ne prétend jamais
-avoir résolu une concurrence qu’il ne peut démontrer.
+Orkia ne reproduit pas le stockage CRDT d’Atomic. Lorsqu’une décision ne peut
+pas être démontrée à partir de la capture et des refs signées, il revient à une
+review Git non scindée plutôt que de prétendre résoudre la concurrence.
 
 ## Contrats fondamentaux
 
 ### Session agent
 
-Une session possède une intention, un commit de base, des tours/actions
-normalisés, les chemins observés, les commandes, les résultats, les coûts et
-les attestations. Elle peut produire plusieurs ChangeSets, y compris dans des
-dépôts différents.
+Une session stocke intention, commit de base, actions normalisées, chemins
+lus/écrits, commandes, résultats, coûts et attestations. Elle peut produire
+des StackPullRequests dans plusieurs dépôts, mais une écriture inconnue réduit
+la couverture et interdit l’automatisation selon la politique.
 
-### ChangeSet
+### StackPullRequest
 
-Un ChangeSet est un objet Git immuable et signé qui contient :
-
-- un `ChangeSetId` stable ;
-- sa session d’origine et l’intention concernée ;
-- le dépôt cible et le commit/base Git projeté ;
-- ses parents ChangeSet et dépendances cross-repo ;
-- les opérations/atomes, preuves, validations et attestations ;
-- son état : proposé, actif, supersédé, intégré ou abandonné ;
-- la projection courante : branche, commit et PR, qui peut être remplacée sans
-  changer l’identité du ChangeSet.
-
-Un rebase, amend ou restack change donc la projection Git mais **pas**
-l’identité, l’historique de review ni la provenance du ChangeSet.
+Une StackPullRequest signée porte la session, le dépôt, les atomes fermés,
+leurs preuves, validations et fragments contextuels. Sa branche, son commit et
+sa PR forge sont des projections versionnées ; rebase, amend ou restack ne
+changent ni son identité ni sa provenance.
 
 ### Stack
 
-Une stack est une vue ordonnée d’un sous-DAG de ChangeSets. Elle est :
+Un Stack signé référence les StackPullRequests d’un seul dépôt et leurs
+racines. Il est la vue Graphite-like ordonnée, reconstruisible depuis les refs
+Orkia et Git sans index local.
 
-- **mono-repo** lorsque toutes ses projections vivent dans le même dépôt ;
-- **multi-repo** lorsqu’un parent ou une dépendance traverse un dépôt ;
-- reproductible depuis les objets Git Orkia, même après perte de cache ou de
-  service.
+### ChangeSet
 
-## Flux Graphite-like cible
+Un ChangeSet signé référence une ou plusieurs paires `{ dépôt, Stack }` et
+éventuellement d’autres ChangeSets. Il exprime l’ordre de livraison et
+d’intégration cross-repo, sans contenir patch, commit ou branche.
+
+## Flux cible
 
 ```text
 main
- └─ auth-model       (ChangeSet A, PR A → main)
-     └─ auth-api     (ChangeSet B, PR B → auth-model)
-         └─ auth-ui  (ChangeSet C, PR C → auth-api)
+ └─ auth-model        (StackPullRequest A)
+     └─ auth-api      (StackPullRequest B)
+         └─ auth-ui   (StackPullRequest C)
+
+Stack « OAuth » dans api : A → B → C
+ChangeSet « OAuth » : Stack api + Stack web + Stack infra
 ```
 
-1. L’agent crée ou enrichit une session.
-2. Orkia découpe les preuves et diffs observés en ChangeSets explicitement
-   validés par l’utilisateur ou une règle.
-3. Orkia projette chaque ChangeSet sur `orkia/cs/<id>` et crée/met à jour la PR
-   avec la branche de son parent comme base.
-4. Une modification de A entraîne la reprojection de A, puis le rebase/restack
-   déterministe de B et C.
-5. Les branches, PRs, validations et diffs changent ; les `ChangeSetId`,
-   commentaires, preuves et dépendances restent stables.
-6. L’intégration respecte l’ordre topologique et refuse une stack dont un
-   parent est invalide, conflictuel ou insuffisamment validé.
+1. L’agent enrichit une session capturée.
+2. Orkia construit les atomes et le plan de review déterministe.
+3. Avec couverture et confiance suffisantes, chaque unité devient une
+   StackPullRequest, puis un Stack mono-repo.
+4. Chaque StackPullRequest est projetée sur `orkia/stack-pr/<id>` ; une PR
+   enfant cible la branche de son parent.
+5. Les stacks de dépôts distincts sont reliés par un ChangeSet et restent
+   bloqués tant qu’une dépendance externe n’est pas publiée et vérifiée.
+6. Une révision amont reprojette les descendants, sans modifier les identités
+   causales ; le ChangeSet conserve l’orchestration multi-repo.
 
-## Flux multi-repo cible
+## Feuille de route de parité Atomic
 
-```text
-Session « OAuth »
-  ├─ api/auth-model      → dépôt api, PR #120
-  ├─ web/auth-client     → dépôt web, PR #88, dépend de api/auth-model
-  └─ infra/auth-config   → dépôt infra, PR #341, dépend de api/auth-model
-```
+### P0 — Contrats et preuves
 
-Chaque dépôt conserve ses commits et PRs Git ordinaires. Le DAG Orkia apporte
-les dépendances qui ne peuvent pas être exprimées par une branche Git unique.
-Le tableau de stack indique l’état de chaque projection et refuse l’intégration
-globale tant que les préconditions inter-dépôts ne sont pas satisfaites.
+- Schémas versionnés, JSON canonique, signatures et migrations pour Session,
+  StackPullRequest, Stack, ChangeSet et Projection.
+- Fixtures de restack, amend, supersession, split, dépendance cross-repo,
+  conflit, fetch dans un ordre différent et perte de cache.
+- États fail-closed explicites : preuve manquante, conflit, politique refusée
+  ou version incompatible.
 
-## Feuille de route P0–P7 révisée
+### P1 — Causalité session → StackPullRequest
 
-### P0 — Contrats, fixtures et migrations
+- Persistance Git signée de sessions, tours, actions, intentions, mémoires,
+  opérations et attestations.
+- Fermeture des preuves et des fragments de patch avant publication d’une
+  StackPullRequest.
+- Lien des diffs observés aux actions d’agent, jamais au seul commit final.
 
-- Définir les schémas versionnés `Session`, `ChangeSet`, `Stack` et
-  `Projection` avec JSON canonique, signatures et migrations réversibles.
-- Écrire les fixtures : restack à trois niveaux, amend d’un parent,
-  abandon/supersession, dépendance cross-repo, conflits, fetch dans un ordre
-  différent et perte du service/cache.
-- Rendre chaque état de dégradation explicite : Git fallback, conflictuel,
-  preuve manquante ou version incompatible.
+### P2 — Analyse et identités stables
 
-**Sortie :** une suite `tests/atomic-parity/` mesure les invariants Atomic
-retenus et une suite `tests/changeset-stacks/` mesure le produit réel.
-
-### P1 — Objets Git et causalité session → ChangeSet
-
-- Finaliser la persistance Git signée des sessions, tours, actions, intentions,
-  mémoires, opérations et attestations.
-- Ajouter `ChangeSet` et `Stack` sous `refs/orkia/*`, avec fermeture des
-  preuves et signatures avant publication.
-- Lier les diffs Git à des actions agent observées, plutôt que les traiter
-  comme des artefacts autonomes.
-
-**Sortie :** un ChangeSet portable explique exactement quelle session et quelles
-preuves ont produit sa projection Git.
-
-### P2 — Identités stables et analyse sémantique
-
-- Stabiliser les identités Trunk/Branch/Leaf et Atom à travers renommage,
-  rebase, restack et modification locale démontrable.
-- Relier les opérations/atomes aux ChangeSets et aux actions agent.
-- Conserver tombstones et alternatives afin qu’un ChangeSet supersédé reste
+- Stabilité des identités Trunk/Branch/Leaf et Atom à travers renommage,
+  rebase, restack et modification locale prouvable.
+- Tombstones et alternatives pour qu’une StackPullRequest supersédée demeure
   traçable.
 
-**Sortie :** rebase/restack ne casse ni la review ni la provenance.
+### P3 — Stacks mono-repo
 
-### P3 — Projection de stacks mono-repo
+- Branches `orkia/stack-pr/<id>`, worktrees isolés et PRs empilées.
+- Restack topologique, reorder, split, fusion, abandon et PR de fermeture
+  explicite lorsque le graphe a plusieurs parents.
+- Shadow refs reconstructibles sans serveur.
 
-- Créer les branches `orkia/cs/<id>` et les vues/worktrees associés.
-- Projeter un DAG en branches empilées, avec la branche du parent comme base de
-  PR.
-- Implémenter amend, reorder, split, squash, abandon et restack automatique.
-- Garder des shadow refs Git pour reconstruire les projections sans service.
+### P4 — Application sémantique sûre
 
-**Sortie :** une stack Graphite-like est créée, modifiée et restackée
-automatiquement sans changer les identités de ChangeSet.
+- Alignement symboles/blocs/token seulement lorsque la preuve est unique.
+- Conflits et résolutions signés, reliés aux StackPullRequests.
+- Arrêt de la stack au premier conflit, avec provenance lisible.
 
-### P4 — Merge et restack sémantique sûr
+### P5 — ChangeSets multi-repo
 
-- Utiliser l’alignement token-level seulement lorsqu’il est prouvable.
-- Enregistrer les conflits/résolutions comme objets signés reliés aux
+- Registre de dépôts, vérification de chaque Stack référencé et dépendances
+  cross-repo explicites.
+- Projection, push et récupération par refs Git ordinaires.
+- Reconstruction de l’index, des projections et du statut depuis Git.
+
+### P6 — Review et expérience agent
+
+- Review par StackPullRequest avec couverture dérivée de la capture.
+- Vue unifiée session, intention, preuves, coûts, diff, parents/enfants et
+  statut forge.
+- Recherche/index reconstruisibles des StackPullRequests, Stacks et
   ChangeSets.
-- Rebaser/restacker les descendants en ordre topologique ; arrêter la stack au
-  premier conflit et fournir la provenance exacte.
 
-**Sortie :** une édition disjointe auto-fusionne ; une concurrence ambiguë
-reste un conflit Git lisible et bloquant.
+### P7 — Forge et contrôle d’intégration
 
-### P5 — Multi-repo, sync et récupération
-
-- Introduire un registre Git de dépôts/projections et les dépendances
-  cross-repo.
-- Projeter, pousser et récupérer les stacks par refs Git ordinaires.
-- Reconstruire index, projections et statut de stack depuis Git.
-- Finaliser OCI : layout importable, attestations, validations et digests.
-
-**Sortie :** une session produit automatiquement une stack de PRs coordonnée
-sur plusieurs dépôts ; un clone neuf peut la reconstruire.
-
-### P6 — Review, query et expérience agent
-
-- Produire une review par ChangeSet, avec couverture dérivée des actions
-  observées et non d’un simple diff.
-- Afficher session, intention, preuves, coûts, diff, parents/enfants et statut
-  forge dans une même vue.
-- Ajouter recherche/index reconstructible des ChangeSets, symboles et
-  dépendances.
-
-**Sortie :** un reviewer sait pourquoi un changement existe, ce qui l’a produit
-et ce qui doit être intégré avant/après lui.
-
-### P7 — Forge et plan de contrôle
-
-- Créer/mettre à jour PRs GitHub/GitLab pour chaque projection de ChangeSet.
-- Synchroniser la base des PRs lors d’un restack et préserver le lien avec les
-  reviews/commentaires lorsque la forge le permet.
-- Appliquer grants, équipes, expiration, révocation et rotation dans le
-  serveur d’autorisation Git-native.
-- Versionner les profils de dépôt/projet/workspace et négocier le protocole.
-
-**Sortie :** Orkia orchestre une stack complète, contrôlée par la politique,
-depuis une session agent jusqu’à l’intégration topologique des PRs.
+- Création ou mise à jour GitHub/GitLab de chaque StackPullRequest projetée.
+- Synchronisation des bases lors d’un restack et préservation des liens de
+  review lorsque la forge le permet.
+- Politique, grants, équipes, expiration, révocation et rotation côté serveur.
 
 ## Invariants de sortie
 
-1. **Identité durable :** un ChangeSet garde le même ID à travers restack,
-   rebase et changement de commit projeté.
-2. **Causalité :** toute projection est reliée à une session, à ses preuves et
-   à ses validations ; le mode non capturé est explicitement faible confiance.
-3. **Convergence :** des clones recevant les mêmes refs dans des ordres
-   différents reconstruisent le même DAG et les mêmes projections attendues.
-4. **Interop Git :** chaque branche et PR reste utilisable par Git et la forge
-   sans client Orkia.
-5. **Repli sûr :** sans preuve suffisante, Orkia n’auto-merge ni ne restacke ;
-   il expose le conflit ou le fallback Git.
-6. **Récupération :** supprimer index, cache ou service ne détruit pas les
-   sessions, ChangeSets, stacks ni projections reconstructibles.
-7. **Multi-repo :** une dépendance inter-dépôts est explicite et bloque
-   correctement l’intégration lorsqu’un parent n’est pas prêt.
-
-## État actuel et priorité immédiate
-
-La base Git-native existe déjà : objets sémantiques signés, manifests,
-vues/worktrees, merge prudent, capture agent, plans, vault, grants, rotation,
-révocation, transport de refs, OCI initial et preuve de convergence à deux
-clones.
-
-La priorité immédiate est **P0 puis P1** : introduire le contrat `ChangeSet`
-et les fixtures de stack. C’est le point qui relie les capacités déjà livrées
-au besoin produit : proposer et restacker automatiquement des PRs mono-repo et
-multi-repo à partir d’une session agent.
+1. Une StackPullRequest conserve son ID à travers rebase et restack ; un Stack
+   et un ChangeSet conservent le leur à travers les projections.
+2. Toute projection est reliée à une session, ses preuves et ses validations.
+3. Des clones recevant les mêmes refs dans des ordres différents reconstruisent
+   les mêmes objets et le même ordre déterministe.
+4. Les branches et PRs restent utilisables par Git et la forge sans client
+   Orkia.
+5. Sans preuve suffisante, Orkia ne crée pas de stack automatique et ne
+   déclenche pas d’intégration automatique.
+6. La perte d’un index, cache ou serveur ne détruit aucun objet reconstructible.
+7. Une dépendance inter-dépôts bloque l’intégration tant que le Stack requis
+   n’est pas publié et vérifié.

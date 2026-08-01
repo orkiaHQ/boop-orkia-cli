@@ -6,6 +6,8 @@ members = [
   "crates/orkia-ledger",
   "crates/orkia-git",
   "crates/orkia-semantic",
+  "crates/orkia-changesets",
+  "crates/orkia-projection",
   "crates/orkia-capture",
   "crates/orkia-agents",
   "crates/orkia-review",
@@ -22,7 +24,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.93"
 authors = ["Orkia contributors"]
 
 [workspace.dependencies]
@@ -34,6 +36,7 @@ ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
 git2 = "0.20"
 hex = "0.4"
 hmac = "0.12"
+jsonwebtoken = "9.3"
 notify = "8.0"
 rand_core = { version = "0.6", features = ["getrandom"] }
 rusqlite = "0.32"

@@ -82,3 +82,42 @@ impl ReviewIndex for MemoryIndex {
             .collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orkia_model::{CaptureEvent, RepositoryId, UnsignedEvent};
+    use orkia_ports::ReviewIndex;
+    use time::OffsetDateTime;
+
+    fn event(kind: CaptureEvent) -> LedgerEvent {
+        LedgerEvent {
+            unsigned: UnsignedEvent {
+                id: orkia_model::EventId::new(),
+                repository: RepositoryId::new(),
+                actor: orkia_model::ActorId::new(),
+                occurred_at: OffsetDateTime::now_utc(),
+                previous_hash: None,
+                event: kind,
+            },
+            hash: "test-hash".into(),
+            signature: "test".into(),
+        }
+    }
+
+    #[test]
+    fn rebuilding_a_projection_replaces_lost_or_stale_index_entries() {
+        let index = MemoryIndex::default();
+        let first = event(CaptureEvent::Checkpoint {
+            commit: "a".repeat(40),
+        });
+        let second = event(CaptureEvent::SessionClosed {
+            session: orkia_model::SessionId::new(),
+        });
+        index.rebuild(std::slice::from_ref(&first)).unwrap();
+        assert_eq!(index.search("checkpoint").unwrap().len(), 1);
+        index.rebuild(std::slice::from_ref(&second)).unwrap();
+        assert!(index.search("checkpoint").unwrap().is_empty());
+        assert_eq!(index.search("session_closed").unwrap().len(), 1);
+    }
+}

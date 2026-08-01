@@ -1,5 +1,5 @@
 [package]
-name = "orkia-forge"
+name = "orkia-changesets"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

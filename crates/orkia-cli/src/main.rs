@@ -6,18 +6,20 @@ use orkia_agents::{
     normalize_hook, parse_hook_payload, reconcile_transcript, status as agent_status,
     transcript_files, transcript_files_at, transcript_snapshot, uninstall as uninstall_agent,
 };
-use orkia_capture::{ClaudeAdapter, CodexAdapter, ProviderAdapter};
+use orkia_capture::{ClaudeAdapter, CodexAdapter, ProviderAdapter, WorkspaceWatcher};
 use orkia_git::LibGit2Repository;
-use orkia_github::GitHubApp;
+use orkia_github::{GitHubApp, GitHubAppCredentials};
 use orkia_identity::Identity;
 use orkia_ledger::{Ledger, SystemClock, verify_chain};
 use orkia_model::{
-    Actor, AgentSnapshotPhase, CaptureEvent, CaptureOrigin, OrkiaError, RepositoryId, Result,
-    ReviewPlan, SessionId,
+    Actor, AgentSnapshotPhase, CaptureEvent, CaptureOrigin, ChangeSetId, ChangeSetStack,
+    OrkiaError, RepositoryId, Result, ReviewPlan, SessionId, StackId,
 };
 use orkia_ports::{Forge, GitRepository, LedgerStore, SecretStore};
 use orkia_review::{PlanningInput, plan};
-use orkia_semantic::{ChangedFile, extract_atoms, infer_dependencies};
+use orkia_semantic::{
+    ChangedFile, changed_line_ranges, extract_atoms_in_ranges, infer_dependencies,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -54,13 +56,37 @@ enum Command {
         #[command(subcommand)]
         command: ReviewCommand,
     },
+    /// Coordinate one or more repository-local stacks without importing their
+    /// Git contents into a central store.
+    Changeset {
+        #[command(subcommand)]
+        command: ChangeSetCommand,
+    },
     Integrate {
-        #[arg(long)]
-        plan: String,
+        /// Integrate one repository-local signed review plan.
+        #[arg(
+            long,
+            conflicts_with = "changeset",
+            required_unless_present = "changeset"
+        )]
+        plan: Option<String>,
+        /// Integrate a signed multi-repository ChangeSet in its topological order.
+        #[arg(long, conflicts_with = "plan", required_unless_present = "plan")]
+        changeset: Option<String>,
+        /// Repository locations used by `--changeset`, each formatted as
+        /// `<repository-uuid>=<absolute-path>`.
+        #[arg(long = "repository-path", requires = "changeset")]
+        repository_path: Vec<String>,
         #[arg(long, default_value = "main")]
         branch: String,
         #[arg(long, default_value_t = 0)]
         approvals: u8,
+        /// GitHub owner. Supply with --github-repository to publish the
+        /// policy check to projected commits.
+        #[arg(long)]
+        github_owner: Option<String>,
+        #[arg(long)]
+        github_repository: Option<String>,
     },
 }
 #[derive(Subcommand)]
@@ -126,6 +152,9 @@ enum SessionCommand {
     },
     Checkpoint,
     Close,
+    /// Internal long-lived watcher spawned by `session start` for humans.
+    #[command(hide = true)]
+    Watch,
 }
 #[derive(Subcommand)]
 enum LedgerCommand {
@@ -141,11 +170,31 @@ enum ReviewCommand {
         #[arg(long)]
         plan: String,
     },
+    Approve {
+        #[arg(long)]
+        plan: String,
+    },
+    RequestChanges {
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        reason: String,
+    },
     Merge {
         #[arg(long)]
         plan: String,
         #[arg(long, required = true, value_delimiter = ',')]
         units: Vec<String>,
+    },
+    Split {
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        unit: String,
+        /// Atom IDs per output unit, separated by `;` (for example
+        /// `atom-a,atom-b;atom-c`).
+        #[arg(long, required = true, value_delimiter = ';')]
+        groups: Vec<String>,
     },
     Project {
         #[arg(long)]
@@ -162,6 +211,37 @@ enum ReviewCommand {
         base: String,
         #[arg(long, default_value = "origin")]
         remote: String,
+    },
+}
+#[derive(Subcommand)]
+enum ChangeSetCommand {
+    /// Create and sign a multi-repository delivery ChangeSet. Each `--stack`
+    /// is `<repository-uuid>:<stack-uuid>`.
+    Create {
+        #[arg(long, required = true)]
+        stack: Vec<String>,
+        /// Repository locations used to verify each referenced Stack before
+        /// publication. Each value is `<repository-uuid>=<absolute-path>`.
+        #[arg(long = "repository-path", required = true)]
+        repository_path: Vec<String>,
+        /// IDs of ChangeSets that must be integrated before this one.
+        #[arg(long = "depends-on")]
+        depends_on: Vec<String>,
+    },
+    /// Display the latest signed revision reconstructed from Git refs.
+    Show {
+        #[arg(long)]
+        id: String,
+    },
+    /// Resolve every exact StackPullRequest/projection selected by this
+    /// ChangeSet and report whether it is ready for coordinated integration.
+    Status {
+        #[arg(long)]
+        id: String,
+        /// Repository locations used to reconstruct every referenced Stack.
+        /// Each value is `<repository-uuid>=<absolute-path>`.
+        #[arg(long = "repository-path", required = true)]
+        repository_path: Vec<String>,
     },
 }
 #[derive(Clone, Copy, ValueEnum)]
@@ -182,6 +262,32 @@ struct SessionState {
     actor: Actor,
     base_commit: String,
     observed_paths: BTreeSet<String>,
+}
+
+#[derive(Serialize)]
+struct ChangeSetReadiness {
+    id: ChangeSetId,
+    revision: u32,
+    ready_for_integration: bool,
+    stacks: Vec<ChangeSetStackReadiness>,
+    execution_order: Vec<ChangeSetExecutionStep>,
+}
+
+#[derive(Serialize)]
+struct ChangeSetStackReadiness {
+    repository: RepositoryId,
+    stack: StackId,
+    revision: u32,
+    pull_request_count: usize,
+    published: bool,
+}
+
+#[derive(Serialize)]
+struct ChangeSetExecutionStep {
+    repository: RepositoryId,
+    pull_request: orkia_model::StackPullRequestId,
+    revision: u32,
+    published: bool,
 }
 #[derive(Clone)]
 struct FileSecrets {
@@ -208,6 +314,52 @@ impl SecretStore for FileSecrets {
         }
         Ok(())
     }
+}
+
+/// Creates the forge adapter from either a credential-brokered installation
+/// token or the complete GitHub App credential set.  The latter is the normal
+/// self-hosted mode: Orkia signs a short-lived JWT locally and asks GitHub for
+/// an installation-scoped token, so a long-lived user token is never needed.
+fn github_app_from_environment(owner: String, repository: String) -> Result<GitHubApp> {
+    if let Ok(token) = std::env::var("ORKIA_GITHUB_INSTALLATION_TOKEN")
+        && !token.is_empty()
+    {
+        return GitHubApp::new(owner, repository, token);
+    }
+    let app_id = std::env::var("ORKIA_GITHUB_APP_ID")
+        .map_err(|_| OrkiaError::NotFound("ORKIA_GITHUB_APP_ID".into()))?
+        .parse::<u64>()
+        .map_err(|_| OrkiaError::Invalid("ORKIA_GITHUB_APP_ID must be an integer".into()))?;
+    let installation_id = std::env::var("ORKIA_GITHUB_INSTALLATION_ID")
+        .map_err(|_| OrkiaError::NotFound("ORKIA_GITHUB_INSTALLATION_ID".into()))?
+        .parse::<u64>()
+        .map_err(|_| {
+            OrkiaError::Invalid("ORKIA_GITHUB_INSTALLATION_ID must be an integer".into())
+        })?;
+    let private_key = match std::env::var("ORKIA_GITHUB_PRIVATE_KEY_PATH") {
+        Ok(path) => fs::read(&path).map_err(|error| {
+            OrkiaError::External(format!("read ORKIA_GITHUB_PRIVATE_KEY_PATH {path}: {error}"))
+        })?,
+        Err(_) => std::env::var("ORKIA_GITHUB_PRIVATE_KEY")
+            .map_err(|_| {
+                OrkiaError::NotFound(
+                    "set ORKIA_GITHUB_INSTALLATION_TOKEN or GitHub App credentials (ORKIA_GITHUB_APP_ID, ORKIA_GITHUB_INSTALLATION_ID and ORKIA_GITHUB_PRIVATE_KEY_PATH)".into(),
+                )
+            })?
+            // GitHub Actions and dotenv stores commonly preserve PEM line
+            // breaks as literal `\\n`; normalize only that encoding.
+            .replace("\\n", "\n")
+            .into_bytes(),
+    };
+    GitHubApp::from_app_credentials(
+        owner,
+        repository,
+        GitHubAppCredentials {
+            app_id,
+            installation_id,
+            private_key_pem: &private_key,
+        },
+    )
 }
 
 fn main() {
@@ -266,22 +418,115 @@ fn run(cli: Cli) -> Result<()> {
         Command::Review { command } => {
             handle_review(command, &git, &root, &cli.repository, &secrets)?
         }
+        Command::Changeset { command } => {
+            handle_changeset(command, &git, &root, &cli.repository, &secrets)?
+        }
         Command::Integrate {
             plan,
+            changeset,
+            repository_path,
             branch,
             approvals,
+            github_owner,
+            github_repository,
         } => {
-            let review: ReviewPlan =
-                read_json(&root.join("orkia/plans").join(format!("{plan}.json")))?;
+            if let Some(changeset) = changeset {
+                if github_owner.is_some() || github_repository.is_some() {
+                    return Err(OrkiaError::Invalid(
+                        "GitHub check publication for a ChangeSet requires one forge credential set per repository; run integrate for each repository plan".into(),
+                    ));
+                }
+                handle_changeset_integration(
+                    &changeset,
+                    &repository_path,
+                    &branch,
+                    approvals,
+                    &git,
+                    &cli.repository,
+                )?;
+                return Ok(());
+            }
+            let plan = plan.expect("clap requires --plan when --changeset is absent");
+            // Integration is a security boundary: never trust the convenient
+            // worktree JSON cache when the signed plan can be reconstructed
+            // directly from refs/orkia/plans in this clone or a bare mirror.
+            let review = signed_review_plan(&root, &git, &cli.repository, &plan)?;
             let policy_path = cli.repository.join("orkia.toml");
             let policy = if policy_path.exists() {
-                orkia_policy::load(&policy_path)?
+                let content = fs::read_to_string(&policy_path).map_err(|error| {
+                    OrkiaError::NotFound(format!("{}: {error}", policy_path.display()))
+                })?;
+                orkia_policy::parse(&content)?
             } else {
                 orkia_model::RepositoryPolicy::default()
             };
             let ledger = open_repository_ledger(&git, &root, &secrets)?;
             let validations = run_validations(&cli.repository, &policy, &ledger)?;
-            orkia_policy::evaluate(&policy, &review, &validations, approvals, &branch)?;
+            let integration =
+                orkia_policy::evaluate(&policy, &review, &validations, approvals, &branch);
+            match (github_owner, github_repository) {
+                (Some(owner), Some(repository)) => {
+                    let github = github_app_from_environment(owner, repository)?;
+                    let summary = match &integration {
+                        Ok(()) => format!(
+                            "Signed plan {} revision {} passed Orkia integration policy for {branch}.",
+                            review.id.0, review.revision
+                        ),
+                        Err(error) => format!(
+                            "Signed plan {} revision {} failed Orkia integration policy for {branch}: {error}",
+                            review.id.0, review.revision
+                        ),
+                    };
+                    for pull_request in git
+                        .semantic_store()
+                        .stack_pull_requests_for_plan(&review, &policy)?
+                    {
+                        let (_, projection) = git
+                            .semantic_store()
+                            .latest_projection_for_stack_pull_request_revision(
+                                &pull_request.id,
+                                pull_request.revision,
+                                &policy,
+                            )?
+                            .ok_or_else(|| {
+                                OrkiaError::NotFound(format!(
+                                    "projection for stack pull request {}",
+                                    pull_request.id.0
+                                ))
+                            })?;
+                        let commit = projection.commit.as_deref().ok_or_else(|| {
+                            OrkiaError::Integrity(format!(
+                                "projection {} has no immutable projected commit",
+                                projection.id.0
+                            ))
+                        })?;
+                        for check in &policy.required_checks {
+                            github.publish_check(commit, check, integration.is_ok(), &summary)?;
+                        }
+                    }
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(OrkiaError::Invalid(
+                        "--github-owner and --github-repository must be supplied together".into(),
+                    ));
+                }
+            }
+            let passed = integration.is_ok();
+            let reason = integration
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "policy passed".into());
+            ledger.append(CaptureEvent::IntegrationEvaluated {
+                plan: Some(review.id.clone()),
+                changeset: None,
+                branch: branch.clone(),
+                approvals,
+                passed,
+                reason,
+            })?;
+            integration?;
             println!("integration policy passed for {branch}");
         }
     }
@@ -531,7 +776,21 @@ fn record_agent_hook(
             checkpoint.clone(),
         )? && plan.coverage_milli >= policy.minimum_coverage_milli
         {
-            persist_review_plan(root, &ledger, &plan, &checkpoint)?;
+            let changes = git.changes_since(&session_base(&events, &session)?)?;
+            let repository_id = session_repository(&events, &session)?;
+            persist_review_plan(
+                root,
+                &ledger,
+                git,
+                secrets,
+                &plan,
+                &checkpoint,
+                &session,
+                &repository_id,
+                &session_base(&events, &session)?,
+                &changes,
+                repository,
+            )?;
         }
     }
     Ok(())
@@ -679,6 +938,22 @@ fn session_base(events: &[orkia_model::LedgerEvent], session: &SessionId) -> Res
         .ok_or_else(|| OrkiaError::NotFound(format!("agent session {}", session.0)))
 }
 
+fn session_repository(
+    events: &[orkia_model::LedgerEvent],
+    session: &SessionId,
+) -> Result<RepositoryId> {
+    events
+        .iter()
+        .find_map(|event| match &event.unsigned.event {
+            CaptureEvent::SessionStarted {
+                session: recorded_session,
+                ..
+            } if recorded_session == session => Some(event.unsigned.repository.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| OrkiaError::NotFound(format!("session repository {}", session.0)))
+}
+
 fn observed_agent_paths(
     events: &[orkia_model::LedgerEvent],
     session: &SessionId,
@@ -707,10 +982,10 @@ fn handle_session(
         SessionCommand::Start { objective, origin } => {
             let identity = load_identity(root, secrets)?;
             let base_commit = git.head_commit()?;
-            let repository: RepositoryId = read_json(&root.join("orkia/repository.json"))?;
+            let repository_id: RepositoryId = read_json(&root.join("orkia/repository.json"))?;
             let state = SessionState {
                 id: SessionId::new(),
-                repository: repository.clone(),
+                repository: repository_id.clone(),
                 actor: identity.actor().clone(),
                 base_commit: base_commit.clone(),
                 observed_paths: BTreeSet::new(),
@@ -732,6 +1007,9 @@ fn handle_session(
                 objective,
             })?;
             write_json(&root.join("orkia/session.json"), &state)?;
+            if matches!(origin, Origin::Human) && !cfg!(test) {
+                spawn_workspace_watcher(repository)?;
+            }
             println!("session {} started", state.id.0);
         }
         SessionCommand::Capture {
@@ -785,6 +1063,16 @@ fn handle_session(
                 Provider::Codex => Box::new(CodexAdapter),
                 Provider::Claude => Box::new(ClaudeAdapter),
             };
+            // Keep the provider's exact stream in the signed ledger as well as
+            // the normalized actions. This is the live-session counterpart to
+            // `AgentCommand::Import` and lets a later adapter version replay
+            // fields that were not understood at capture time.
+            ledger.append(CaptureEvent::AgentTranscript {
+                agent: adapter.provider_name().into(),
+                path: format!("agent://{}/{}", adapter.provider_name(), state.id.0),
+                encoding: "utf-8".into(),
+                content: stdout.clone(),
+            })?;
             for event in adapter.capture(&stdout) {
                 ledger.append(event)?;
             }
@@ -851,7 +1139,19 @@ fn handle_session(
                 checkpoint.clone(),
             )? {
                 Some(plan) if plan.coverage_milli >= policy.minimum_coverage_milli => {
-                    persist_review_plan(root, &ledger, &plan, &checkpoint)?;
+                    persist_review_plan(
+                        root,
+                        &ledger,
+                        git,
+                        secrets,
+                        &plan,
+                        &checkpoint,
+                        &state.id,
+                        &state.repository,
+                        &state.base_commit,
+                        &changes,
+                        repository,
+                    )?;
                     println!(
                         "checkpoint captured; automatic review plan {}: {} unit(s), {} atom(s), coverage {}‰",
                         plan.id.0,
@@ -873,8 +1173,45 @@ fn handle_session(
             let _ = fs::remove_file(root.join("orkia/session.json"));
             println!("session closed");
         }
+        SessionCommand::Watch => {
+            let (_, ledger) = open_ledger(git, root, secrets)?;
+            let watcher = WorkspaceWatcher::start(repository)?;
+            let session_path = root.join("orkia/session.json");
+            while session_path.exists() {
+                let modified = watcher
+                    .drain()
+                    .into_iter()
+                    .filter_map(|path| path.strip_prefix(repository).ok().map(Path::to_path_buf))
+                    .filter(|path| !path.starts_with(".git"))
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .collect::<BTreeSet<_>>();
+                if !modified.is_empty() {
+                    ledger.append(CaptureEvent::FilesObserved {
+                        read: BTreeSet::new(),
+                        modified,
+                        unknown_write: true,
+                    })?;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
     }
     Ok(())
+}
+
+fn spawn_workspace_watcher(repository: &Path) -> Result<()> {
+    let executable = std::env::current_exe()
+        .map_err(|error| OrkiaError::External(format!("locate Orkia executable: {error}")))?;
+    std::process::Command::new(executable)
+        .arg("--repository")
+        .arg(repository)
+        .args(["session", "watch"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| OrkiaError::External(format!("start workspace watcher: {error}")))
 }
 fn handle_review(
     command: ReviewCommand,
@@ -900,7 +1237,21 @@ fn handle_review(
                 )));
             }
             let ledger = open_repository_ledger(git, root, secrets)?;
-            persist_review_plan(root, &ledger, &plan, &checkpoint)?;
+            let changes = git.changes_since(&base)?;
+            let repository_id = session_repository(&events, &session)?;
+            persist_review_plan(
+                root,
+                &ledger,
+                git,
+                secrets,
+                &plan,
+                &checkpoint,
+                &session,
+                &repository_id,
+                &base,
+                &changes,
+                repository,
+            )?;
             println!(
                 "review plan {}: {} unit(s), {} atom(s), coverage {}‰",
                 plan.id.0,
@@ -910,20 +1261,47 @@ fn handle_review(
             );
         }
         ReviewCommand::Show { plan } => {
-            let value: ReviewPlan =
-                read_json(&root.join("orkia/plans").join(format!("{plan}.json")))?;
+            let value = signed_review_plan(root, git, repository, &plan)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&value)
                     .map_err(|e| OrkiaError::Invalid(e.to_string()))?
             );
         }
+        ReviewCommand::Approve { plan: plan_id } => {
+            let current = signed_review_plan(root, git, repository, &plan_id)?;
+            let revised = orkia_review::set_status(&current, orkia_model::PlanStatus::Approved)?;
+            persist_revised_plan(
+                root,
+                git,
+                repository,
+                secrets,
+                &revised,
+                "reviewer approval via CLI",
+            )?;
+            println!(
+                "review plan {} revision {} approved",
+                revised.id.0, revised.revision
+            );
+        }
+        ReviewCommand::RequestChanges {
+            plan: plan_id,
+            reason,
+        } => {
+            let current = signed_review_plan(root, git, repository, &plan_id)?;
+            let revised =
+                orkia_review::set_status(&current, orkia_model::PlanStatus::ChangesRequested)?;
+            persist_revised_plan(root, git, repository, secrets, &revised, &reason)?;
+            println!(
+                "review plan {} revision {} changes requested",
+                revised.id.0, revised.revision
+            );
+        }
         ReviewCommand::Merge {
             plan: plan_id,
             units,
         } => {
-            let path = root.join("orkia/plans").join(format!("{plan_id}.json"));
-            let current: ReviewPlan = read_json(&path)?;
+            let current = signed_review_plan(root, git, repository, &plan_id)?;
             let units = units
                 .into_iter()
                 .filter(|value| !value.trim().is_empty())
@@ -944,44 +1322,108 @@ fn handle_review(
                     reason: "reviewer merge via CLI".into(),
                 },
             )?;
-            let destination = root
-                .join("orkia/plans")
-                .join(format!("{}.json", revised.id.0));
-            write_json(&destination, &revised)?;
-            open_repository_ledger(git, root, secrets)?.append(
-                CaptureEvent::ReviewPlanRevised {
-                    plan: revised.id.clone(),
-                    revision: revised.revision,
-                    reason: "reviewer merge via CLI".into(),
+            persist_revised_plan(
+                root,
+                git,
+                repository,
+                secrets,
+                &revised,
+                "reviewer merge via CLI",
+            )?;
+            println!("review plan revision {} created", revised.id.0);
+        }
+        ReviewCommand::Split {
+            plan: plan_id,
+            unit,
+            groups,
+        } => {
+            let current = signed_review_plan(root, git, repository, &plan_id)?;
+            let unit = unit
+                .parse::<uuid::Uuid>()
+                .map(orkia_model::ReviewUnitId)
+                .map_err(|error| OrkiaError::Invalid(format!("invalid review unit id: {error}")))?;
+            let groups = groups
+                .into_iter()
+                .map(|group| {
+                    group
+                        .split(',')
+                        .filter(|atom| !atom.trim().is_empty())
+                        .map(|atom| {
+                            atom.trim()
+                                .parse::<uuid::Uuid>()
+                                .map(orkia_model::AtomId)
+                                .map_err(|error| {
+                                    OrkiaError::Invalid(format!("invalid atom id: {error}"))
+                                })
+                        })
+                        .collect::<Result<BTreeSet<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let revised = orkia_review::apply_correction(
+                &current,
+                orkia_review::ReviewerCorrection::Split {
+                    unit,
+                    groups,
+                    reason: "reviewer split via CLI".into(),
                 },
+            )?;
+            persist_revised_plan(
+                root,
+                git,
+                repository,
+                secrets,
+                &revised,
+                "reviewer split via CLI",
             )?;
             println!("review plan revision {} created", revised.id.0);
         }
         ReviewCommand::Project { plan: plan_id } => {
-            let plan: ReviewPlan =
-                read_json(&root.join("orkia/plans").join(format!("{plan_id}.json")))?;
-            let base = latest_session_base(&git.ledger_store().read_all()?)?;
-            let mut commits = BTreeMap::new();
-            for projection in orkia_forge::projections(&plan, &base)? {
-                let parent = commits
-                    .get(&projection.base)
-                    .cloned()
-                    .unwrap_or(projection.base.clone());
-                let unit = plan
-                    .units
-                    .iter()
-                    .find(|unit| unit.id == projection.unit)
-                    .ok_or_else(|| OrkiaError::NotFound("projected review unit".into()))?;
-                let paths = unit
-                    .atoms
-                    .iter()
-                    .filter_map(|atom| plan.atom_paths.get(atom).cloned())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                let commit = git.project_paths(&projection.branch, &parent, &paths)?;
-                commits.insert(projection.branch.clone(), commit.clone());
-                println!("{} -> {}", projection.branch, commit);
+            let policy = load_repository_policy(repository)?;
+            let plan = signed_review_plan(root, git, repository, &plan_id)?;
+            let events = git.ledger_store().read_all()?;
+            let (_, base, _) = plan_session_context(&events, &plan)?;
+            let pull_requests = git
+                .semantic_store()
+                .stack_pull_requests_for_plan(&plan, &policy)?;
+            let by_id = pull_requests
+                .iter()
+                .map(|pull_request| (pull_request.id.clone(), pull_request))
+                .collect::<BTreeMap<_, _>>();
+            let identity = load_identity(root, secrets)?;
+            let ledger = open_repository_ledger(git, root, secrets)?;
+            for materialized in
+                orkia_projection::restack_mono_repository(git, &pull_requests, "main", &base)?
+            {
+                let pull_request = by_id[&materialized.step.pull_request];
+                let previous = git
+                    .semantic_store()
+                    .latest_projection_for_stack_pull_request(&pull_request.id, &policy)?;
+                let projection = orkia_model::Projection {
+                    schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
+                    id: orkia_model::ProjectionId::from_stack_pull_request(&pull_request.id),
+                    revision: previous
+                        .as_ref()
+                        .map_or(0, |(_, projection)| projection.revision + 1),
+                    stack_pull_request: pull_request.id.clone(),
+                    stack_pull_request_revision: pull_request.revision,
+                    repository: pull_request.repository.clone(),
+                    branch: materialized.step.branch.clone(),
+                    base_branch: materialized.step.parent_branch.clone(),
+                    base_commit: materialized.parent_commit.clone(),
+                    commit: Some(materialized.commit.clone()),
+                    forge_pull_request: None,
+                    status: orkia_model::ProjectionStatus::Projected,
+                    supersedes: previous.map(|(object, _)| object),
+                };
+                git.semantic_store()
+                    .store_projection(&projection, &identity)?;
+                ledger.append(CaptureEvent::ProjectionUpdated {
+                    projection: projection.id.clone(),
+                    pull_request: pull_request.id.clone(),
+                    revision: projection.revision,
+                    commit: projection.commit.clone(),
+                })?;
+                println!("{} -> {}", materialized.step.branch, materialized.commit);
             }
         }
         ReviewCommand::Publish {
@@ -991,19 +1433,665 @@ fn handle_review(
             base,
             remote,
         } => {
-            let token = std::env::var("ORKIA_GITHUB_INSTALLATION_TOKEN")
-                .map_err(|_| OrkiaError::NotFound("ORKIA_GITHUB_INSTALLATION_TOKEN".into()))?;
-            let plan: ReviewPlan =
-                read_json(&root.join("orkia/plans").join(format!("{plan_id}.json")))?;
-            let github = GitHubApp::new(github_owner, github_repository, token)?;
-            for projection in orkia_forge::projections(&plan, &base)? {
-                git.push_branch(&remote, &projection.branch)?;
-                let url = github.publish(&projection)?;
+            let policy = load_repository_policy(repository)?;
+            let plan = signed_review_plan(root, git, repository, &plan_id)?;
+            let pull_requests = git
+                .semantic_store()
+                .stack_pull_requests_for_plan(&plan, &policy)?;
+            let github = github_app_from_environment(github_owner, github_repository)?;
+            if policy.protected_branches.contains(&base) {
+                github.set_required_checks(
+                    &base,
+                    &policy.required_checks.iter().cloned().collect::<Vec<_>>(),
+                    policy.required_approvals,
+                )?;
+            }
+            let identity = load_identity(root, secrets)?;
+            let ledger = open_repository_ledger(git, root, secrets)?;
+            // Publish the immutable causal evidence before creating any forge
+            // review. A GitHub PR must never point at a branch whose signed
+            // plan/StackPullRequest cannot be fetched by a reviewer.
+            git.push_orkia_refs(&remote)?;
+            for review in orkia_forge::stack_pull_request_projections(&pull_requests, &base)? {
+                let pull_request = review.pull_request.as_ref().ok_or_else(|| {
+                    OrkiaError::Integrity(
+                        "forge projection has no stack pull request identity".into(),
+                    )
+                })?;
+                let stack_pull_request = pull_requests
+                    .iter()
+                    .find(|candidate| &candidate.id == pull_request)
+                    .ok_or_else(|| {
+                        OrkiaError::Integrity(format!(
+                            "forge projection references an absent stack pull request {}",
+                            pull_request.0
+                        ))
+                    })?;
+                git.push_branch(&remote, &review.branch)?;
+                let url = github.publish(&review)?;
+                let previous = git
+                    .semantic_store()
+                    .latest_projection_for_stack_pull_request_revision(
+                        pull_request,
+                        stack_pull_request.revision,
+                        &policy,
+                    )?
+                    .ok_or_else(|| {
+                        OrkiaError::NotFound(format!(
+                            "projection for stack pull request {}",
+                            pull_request.0
+                        ))
+                    })?;
+                let mut published = previous.1.clone();
+                published.revision += 1;
+                published.forge_pull_request = Some(url.clone());
+                published.status = orkia_model::ProjectionStatus::Published;
+                published.supersedes = Some(previous.0);
+                git.semantic_store()
+                    .store_projection(&published, &identity)?;
+                ledger.append(CaptureEvent::ProjectionUpdated {
+                    projection: published.id.clone(),
+                    pull_request: published.stack_pull_request.clone(),
+                    revision: published.revision,
+                    commit: published.commit.clone(),
+                })?;
                 println!("{}", url);
             }
+            // The forge URL and publication ledger events were created above;
+            // synchronize their signed revisions as the final publication
+            // step as well.
+            git.push_orkia_refs(&remote)?;
         }
     }
     Ok(())
+}
+
+fn handle_changeset(
+    command: ChangeSetCommand,
+    git: &LibGit2Repository,
+    root: &Path,
+    repository: &Path,
+    secrets: &FileSecrets,
+) -> Result<()> {
+    let policy = load_repository_policy(repository)?;
+    match command {
+        ChangeSetCommand::Create {
+            stack,
+            repository_path,
+            depends_on,
+        } => {
+            let references = stack
+                .iter()
+                .map(|value| parse_changeset_stack_reference(value))
+                .collect::<Result<BTreeSet<_>>>()?;
+            let repository_paths = repository_path
+                .iter()
+                .map(|value| parse_changeset_repository_path(value))
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            let references = verify_referenced_stacks(&references, &repository_paths)?;
+            let mut change_set = orkia_changesets::change_set_from_stack_references(references)?;
+            for dependency in depends_on {
+                let id = dependency
+                    .trim()
+                    .parse::<uuid::Uuid>()
+                    .map(ChangeSetId)
+                    .map_err(|error| {
+                        OrkiaError::Invalid(format!("invalid ChangeSet dependency: {error}"))
+                    })?;
+                orkia_changesets::add_changeset_dependency(&mut change_set, id)?;
+            }
+            // A delivery dependency is meaningful only when its signed
+            // ChangeSet has already completed integration in this
+            // coordinator. Do not leave an implicit promise to an external,
+            // absent or merely published stack.
+            for dependency in &change_set.depends_on {
+                let Some((_, dependency_changeset)) =
+                    git.semantic_store().latest_changeset(dependency, &policy)?
+                else {
+                    return Err(OrkiaError::NotFound(format!(
+                        "integrated ChangeSet dependency {}",
+                        dependency.0
+                    )));
+                };
+                if !matches!(
+                    dependency_changeset.status,
+                    orkia_model::StackPullRequestStatus::Integrated
+                ) {
+                    return Err(OrkiaError::Policy(format!(
+                        "ChangeSet dependency {} is not integrated",
+                        dependency.0
+                    )));
+                }
+            }
+            let identity = load_identity(root, secrets)?;
+            if let Some((previous, current)) = git
+                .semantic_store()
+                .latest_changeset(&change_set.id, &policy)?
+            {
+                if current.stacks == change_set.stacks
+                    && current.depends_on == change_set.depends_on
+                    && current.status == change_set.status
+                {
+                    println!(
+                        "changeset {} revision {} already published",
+                        current.id.0, current.revision
+                    );
+                    return Ok(());
+                }
+                change_set.revision = current.revision + 1;
+                change_set.supersedes = Some(previous);
+            }
+            let object = git
+                .semantic_store()
+                .store_changeset(&change_set, &identity)?;
+            let ledger = open_repository_ledger(git, root, secrets)?;
+            ledger.append(CaptureEvent::ChangeSetPublished {
+                changeset: change_set.id.clone(),
+                revision: change_set.revision,
+                object,
+            })?;
+            println!(
+                "changeset {} revision {} published",
+                change_set.id.0, change_set.revision
+            );
+        }
+        ChangeSetCommand::Show { id } => {
+            let id = id
+                .parse::<uuid::Uuid>()
+                .map(ChangeSetId)
+                .map_err(|error| OrkiaError::Invalid(format!("invalid ChangeSet ID: {error}")))?;
+            let (_, change_set) = git
+                .semantic_store()
+                .latest_changeset(&id, &policy)?
+                .ok_or_else(|| OrkiaError::NotFound(format!("ChangeSet {}", id.0)))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&change_set)
+                    .map_err(|error| OrkiaError::Invalid(error.to_string()))?
+            );
+        }
+        ChangeSetCommand::Status {
+            id,
+            repository_path,
+        } => {
+            let id = id
+                .parse::<uuid::Uuid>()
+                .map(ChangeSetId)
+                .map_err(|error| OrkiaError::Invalid(format!("invalid ChangeSet ID: {error}")))?;
+            let (_, change_set) = git
+                .semantic_store()
+                .latest_changeset(&id, &policy)?
+                .ok_or_else(|| OrkiaError::NotFound(format!("ChangeSet {}", id.0)))?;
+            let repository_paths = repository_path
+                .iter()
+                .map(|value| parse_changeset_repository_path(value))
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            let mut dependencies = BTreeMap::new();
+            let mut pending = change_set.depends_on.iter().cloned().collect::<Vec<_>>();
+            while let Some(dependency) = pending.pop() {
+                if dependencies.contains_key(&dependency) {
+                    continue;
+                }
+                let Some((_, dependency_changeset)) = git
+                    .semantic_store()
+                    .latest_changeset(&dependency, &policy)?
+                else {
+                    return Err(OrkiaError::NotFound(format!(
+                        "published ChangeSet dependency {}",
+                        dependency.0
+                    )));
+                };
+                if !matches!(
+                    dependency_changeset.status,
+                    orkia_model::StackPullRequestStatus::Integrated
+                ) {
+                    return Err(OrkiaError::Policy(format!(
+                        "ChangeSet dependency {} is not integrated",
+                        dependency.0
+                    )));
+                }
+                if !change_set_readiness(&dependency_changeset, &repository_paths)?
+                    .ready_for_integration
+                {
+                    return Err(OrkiaError::Conflict(format!(
+                        "ChangeSet dependency {} is not forge-published",
+                        dependency.0
+                    )));
+                }
+                pending.extend(dependency_changeset.depends_on.iter().cloned());
+                dependencies.insert(dependency, dependency_changeset);
+            }
+            let mut groups = vec![change_set.clone()];
+            groups.extend(dependencies.into_values());
+            orkia_changesets::changeset_execution_order(&groups)?;
+            let readiness = change_set_readiness(&change_set, &repository_paths)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&readiness)
+                    .map_err(|error| OrkiaError::Invalid(error.to_string()))?
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Evaluates every repository-local review selected by a ChangeSet.  A
+/// ChangeSet is a coordinator object, so it never gets treated as a Git
+/// commit: each repository's signed plan, policy, validations and exact
+/// projection are checked independently before the global execution order is
+/// accepted.
+#[allow(clippy::too_many_arguments)]
+fn handle_changeset_integration(
+    changeset_id: &str,
+    repository_paths: &[String],
+    branch: &str,
+    approvals: u8,
+    coordinator_git: &LibGit2Repository,
+    coordinator_repository: &Path,
+) -> Result<()> {
+    let id = changeset_id
+        .parse::<uuid::Uuid>()
+        .map(ChangeSetId)
+        .map_err(|error| OrkiaError::Invalid(format!("invalid ChangeSet ID: {error}")))?;
+    let coordinator_policy = load_repository_policy(coordinator_repository)?;
+    let (changeset_object, changeset) = coordinator_git
+        .semantic_store()
+        .latest_changeset(&id, &coordinator_policy)?
+        .ok_or_else(|| OrkiaError::NotFound(format!("ChangeSet {}", id.0)))?;
+    if matches!(
+        changeset.status,
+        orkia_model::StackPullRequestStatus::Integrated
+    ) {
+        return Err(OrkiaError::Conflict(format!(
+            "ChangeSet {} is already integrated at revision {}",
+            changeset.id.0, changeset.revision
+        )));
+    }
+    let coordinator_root = git_dir(coordinator_repository)?;
+    let coordinator_secrets = FileSecrets {
+        root: coordinator_root.join("orkia/keys"),
+    };
+    let coordinator_ledger =
+        open_repository_ledger(coordinator_git, &coordinator_root, &coordinator_secrets)?;
+
+    let paths = repository_paths
+        .iter()
+        .map(|value| parse_changeset_repository_path(value))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+
+    // Validate the complete ChangeSet dependency closure, not just its direct
+    // edges. This prevents a cycle or a vanished prerequisite from being
+    // hidden behind an otherwise valid signed coordinator object.
+    let mut all_changesets = BTreeMap::from([(changeset.id.clone(), changeset.clone())]);
+    let mut pending = vec![changeset.clone()];
+    while let Some(current) = pending.pop() {
+        for dependency in &current.depends_on {
+            if all_changesets.contains_key(dependency) {
+                continue;
+            }
+            let (_, dependency_changeset) = coordinator_git
+                .semantic_store()
+                .latest_changeset(dependency, &coordinator_policy)?
+                .ok_or_else(|| {
+                    OrkiaError::NotFound(format!("published ChangeSet dependency {}", dependency.0))
+                })?;
+            all_changesets.insert(dependency.clone(), dependency_changeset.clone());
+            pending.push(dependency_changeset);
+        }
+    }
+    orkia_changesets::changeset_execution_order(
+        &all_changesets.values().cloned().collect::<Vec<_>>(),
+    )?;
+
+    // A signed dependency ref is not equivalent to a delivered dependency.
+    // Reconstruct every prerequisite's exact stack revisions and require its
+    // projections to be forge-published before allowing the dependent group
+    // to integrate.
+    for dependency in all_changesets
+        .values()
+        .filter(|candidate| candidate.id != changeset.id)
+    {
+        if !matches!(
+            dependency.status,
+            orkia_model::StackPullRequestStatus::Integrated
+        ) {
+            return Err(OrkiaError::Policy(format!(
+                "ChangeSet {} depends on ChangeSet {} which is not integrated",
+                changeset.id.0, dependency.id.0
+            )));
+        }
+        let readiness = change_set_readiness(dependency, &paths)?;
+        if !readiness.ready_for_integration {
+            return Err(OrkiaError::Policy(format!(
+                "ChangeSet {} depends on unpublished ChangeSet {}",
+                changeset.id.0, dependency.id.0
+            )));
+        }
+    }
+    let readiness = change_set_readiness(&changeset, &paths)?;
+    if !readiness.ready_for_integration {
+        return Err(OrkiaError::Policy(format!(
+            "ChangeSet {} is not ready: every selected StackPullRequest revision must have a published projection",
+            changeset.id.0
+        )));
+    }
+
+    let mut evaluated = BTreeSet::new();
+    for reference in &changeset.stacks {
+        let path = paths.get(&reference.repository).ok_or_else(|| {
+            OrkiaError::Invalid(format!(
+                "missing --repository-path for referenced repository {}",
+                reference.repository.0
+            ))
+        })?;
+        let foreign_git = LibGit2Repository::open(path)?;
+        let foreign_root = git_dir(path)?;
+        let foreign_secrets = FileSecrets {
+            root: foreign_root.join("orkia/keys"),
+        };
+        let policy = load_repository_policy(path)?;
+        let (_, stack) = foreign_git
+            .semantic_store()
+            .stack_at_revision(&reference.stack, reference.revision, &policy)?
+            .ok_or_else(|| {
+                OrkiaError::NotFound(format!(
+                    "Stack {} revision {} in repository {}",
+                    reference.stack.0, reference.revision, reference.repository.0
+                ))
+            })?;
+        let pull_request_revisions = if stack.pull_request_revisions.is_empty() {
+            stack
+                .pull_requests
+                .iter()
+                .map(|pull_request| (pull_request, 0))
+                .collect::<Vec<_>>()
+        } else {
+            stack
+                .pull_request_revisions
+                .iter()
+                .map(|(pull_request, revision)| (pull_request, *revision))
+                .collect::<Vec<_>>()
+        };
+        for (pull_request_id, pull_request_revision) in pull_request_revisions {
+            let (_, pull_request) = foreign_git
+                .semantic_store()
+                .stack_pull_request_at_revision(pull_request_id, pull_request_revision, &policy)?
+                .ok_or_else(|| {
+                    OrkiaError::NotFound(format!(
+                        "StackPullRequest {} revision {}",
+                        pull_request_id.0, pull_request_revision
+                    ))
+                })?;
+            let source_plan = pull_request.source_plan.clone().ok_or_else(|| {
+                OrkiaError::Integrity(format!(
+                    "StackPullRequest {} has no signed source review plan",
+                    pull_request.id.0
+                ))
+            })?;
+            let review = signed_review_plan(
+                &foreign_root,
+                &foreign_git,
+                path,
+                &source_plan.0.to_string(),
+            )?;
+            if review.revision != pull_request.source_plan_revision {
+                return Err(OrkiaError::Integrity(format!(
+                    "StackPullRequest {} selects review plan revision {}, but the signed plan is revision {}",
+                    pull_request.id.0, pull_request.source_plan_revision, review.revision
+                )));
+            }
+            let ledger = open_repository_ledger(&foreign_git, &foreign_root, &foreign_secrets)?;
+            let validations = run_validations(path, &policy, &ledger)?;
+            orkia_policy::evaluate(&policy, &review, &validations, approvals, branch)?;
+            evaluated.insert((reference.repository.clone(), pull_request.id.clone()));
+        }
+    }
+    let identity = load_identity(&coordinator_root, &coordinator_secrets)?;
+    let mut integrated = changeset.clone();
+    integrated.revision += 1;
+    integrated.status = orkia_model::StackPullRequestStatus::Integrated;
+    integrated.supersedes = Some(changeset_object);
+    coordinator_git
+        .semantic_store()
+        .store_changeset(&integrated, &identity)?;
+    coordinator_ledger.append(CaptureEvent::IntegrationEvaluated {
+        plan: None,
+        changeset: Some(integrated.id.clone()),
+        branch: branch.into(),
+        approvals,
+        passed: true,
+        reason: "all dependency and repository policies passed".into(),
+    })?;
+    coordinator_ledger.append(CaptureEvent::ChangeSetIntegrated {
+        changeset: integrated.id.clone(),
+        revision: integrated.revision,
+    })?;
+    println!(
+        "ChangeSet {} revision {} integration policy passed for {} selected StackPullRequest(s) in topological order",
+        integrated.id.0,
+        integrated.revision,
+        evaluated.len()
+    );
+    for step in readiness.execution_order {
+        println!(
+            "{}:{} revision {} published={}",
+            step.repository.0, step.pull_request.0, step.revision, step.published
+        );
+    }
+    Ok(())
+}
+
+fn parse_changeset_stack_reference(value: &str) -> Result<ChangeSetStack> {
+    let (repository, stack) = value.trim().split_once(':').ok_or_else(|| {
+        OrkiaError::Invalid("a stack reference must be <repository-uuid>:<stack-uuid>".into())
+    })?;
+    let repository = repository
+        .parse::<uuid::Uuid>()
+        .map(RepositoryId)
+        .map_err(|error| OrkiaError::Invalid(format!("invalid stack repository ID: {error}")))?;
+    let stack = stack
+        .parse::<uuid::Uuid>()
+        .map(StackId)
+        .map_err(|error| OrkiaError::Invalid(format!("invalid stack ID: {error}")))?;
+    Ok(ChangeSetStack {
+        repository,
+        stack,
+        revision: 0,
+    })
+}
+
+fn parse_changeset_repository_path(value: &str) -> Result<(RepositoryId, PathBuf)> {
+    let (repository, path) = value.trim().split_once('=').ok_or_else(|| {
+        OrkiaError::Invalid("a repository path must be <repository-uuid>=<absolute-path>".into())
+    })?;
+    let repository = repository
+        .parse::<uuid::Uuid>()
+        .map(RepositoryId)
+        .map_err(|error| OrkiaError::Invalid(format!("invalid repository path ID: {error}")))?;
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(OrkiaError::Invalid(
+            "a changeset repository path must be absolute".into(),
+        ));
+    }
+    Ok((repository, path))
+}
+
+fn verify_referenced_stacks(
+    references: &BTreeSet<ChangeSetStack>,
+    repository_paths: &BTreeMap<RepositoryId, PathBuf>,
+) -> Result<BTreeSet<ChangeSetStack>> {
+    let mut verified = BTreeSet::new();
+    for reference in references {
+        let path = repository_paths.get(&reference.repository).ok_or_else(|| {
+            OrkiaError::Invalid(format!(
+                "missing --repository-path for referenced repository {}",
+                reference.repository.0
+            ))
+        })?;
+        let git_root = git_dir(path)?;
+        let declared: RepositoryId = read_json(&git_root.join("orkia/repository.json"))?;
+        if declared != reference.repository {
+            return Err(OrkiaError::Integrity(format!(
+                "repository path {} declares {}, not {}",
+                path.display(),
+                declared.0,
+                reference.repository.0
+            )));
+        }
+        let git = LibGit2Repository::open(path)?;
+        let policy = load_repository_policy(path)?;
+        let (_, stack) = git
+            .semantic_store()
+            .latest_stack(&reference.stack, &policy)?
+            .ok_or_else(|| {
+                OrkiaError::NotFound(format!(
+                    "referenced stack {} in repository {}",
+                    reference.stack.0, reference.repository.0
+                ))
+            })?;
+        if stack.repository != reference.repository || stack.id != reference.stack {
+            return Err(OrkiaError::Integrity(
+                "a referenced stack does not match its declared repository identity".into(),
+            ));
+        }
+        verified.insert(ChangeSetStack {
+            repository: reference.repository.clone(),
+            stack: reference.stack.clone(),
+            revision: stack.revision,
+        });
+    }
+    Ok(verified)
+}
+
+/// Computes publication readiness without consulting any local index or
+/// mutable worktree plan. A ChangeSet selects exact Stack and
+/// StackPullRequest revisions, and only a `Published` projection of that same
+/// revision can make it ready.
+fn change_set_readiness(
+    change_set: &orkia_model::ChangeSet,
+    repository_paths: &BTreeMap<RepositoryId, PathBuf>,
+) -> Result<ChangeSetReadiness> {
+    let mut stacks = Vec::new();
+    let mut ready_for_integration = true;
+    let mut selected_pull_requests = Vec::new();
+    let mut selected_metadata = BTreeMap::new();
+    for reference in &change_set.stacks {
+        let path = repository_paths.get(&reference.repository).ok_or_else(|| {
+            OrkiaError::Invalid(format!(
+                "missing --repository-path for referenced repository {}",
+                reference.repository.0
+            ))
+        })?;
+        let git_root = git_dir(path)?;
+        let declared: RepositoryId = read_json(&git_root.join("orkia/repository.json"))?;
+        if declared != reference.repository {
+            return Err(OrkiaError::Integrity(format!(
+                "repository path {} declares {}, not {}",
+                path.display(),
+                declared.0,
+                reference.repository.0
+            )));
+        }
+        let git = LibGit2Repository::open(path)?;
+        let policy = load_repository_policy(path)?;
+        let (_, stack) = git
+            .semantic_store()
+            .stack_at_revision(&reference.stack, reference.revision, &policy)?
+            .ok_or_else(|| {
+                OrkiaError::NotFound(format!(
+                    "Stack {} revision {} in repository {}",
+                    reference.stack.0, reference.revision, reference.repository.0
+                ))
+            })?;
+        if stack.repository != reference.repository || stack.id != reference.stack {
+            return Err(OrkiaError::Integrity(
+                "referenced Stack does not match its declared repository identity".into(),
+            ));
+        }
+        let pull_request_revisions = if stack.pull_request_revisions.is_empty() {
+            stack
+                .pull_requests
+                .iter()
+                .map(|pull_request| (pull_request, 0))
+                .collect::<Vec<_>>()
+        } else {
+            stack
+                .pull_request_revisions
+                .iter()
+                .map(|(pull_request, revision)| (pull_request, *revision))
+                .collect::<Vec<_>>()
+        };
+        let mut published = true;
+        for (pull_request, revision) in pull_request_revisions {
+            let (_, selected_pull_request) = git
+                .semantic_store()
+                .stack_pull_request_at_revision(pull_request, revision, &policy)?
+                .ok_or_else(|| {
+                    OrkiaError::NotFound(format!(
+                        "StackPullRequest {} revision {}",
+                        pull_request.0, revision
+                    ))
+                })?;
+            let projection = git
+                .semantic_store()
+                .latest_projection_for_stack_pull_request_revision(
+                    pull_request,
+                    revision,
+                    &policy,
+                )?;
+            let projection_published = projection.as_ref().is_some_and(|(_, projection)| {
+                orkia_changesets::projection_is_published_for(
+                    projection,
+                    &reference.repository,
+                    pull_request,
+                    revision,
+                )
+            });
+            published &= projection_published;
+            selected_metadata.insert(
+                (reference.repository.clone(), pull_request.clone()),
+                (revision, projection_published),
+            );
+            selected_pull_requests.push(selected_pull_request);
+        }
+        ready_for_integration &= published;
+        stacks.push(ChangeSetStackReadiness {
+            repository: reference.repository.clone(),
+            stack: stack.id,
+            revision: stack.revision,
+            pull_request_count: stack.pull_requests.len(),
+            published,
+        });
+    }
+    let execution_order =
+        orkia_changesets::stack_pull_request_execution_order(&selected_pull_requests)?
+            .into_iter()
+            .map(|(repository, pull_request)| {
+                let (revision, published) = selected_metadata
+                    .get(&(repository.clone(), pull_request.clone()))
+                    .copied()
+                    .ok_or_else(|| {
+                        OrkiaError::Integrity(
+                    "topological stack order contains a pull request not selected by the ChangeSet"
+                        .into(),
+                )
+                    })?;
+                Ok(ChangeSetExecutionStep {
+                    repository,
+                    pull_request,
+                    revision,
+                    published,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+    Ok(ChangeSetReadiness {
+        id: change_set.id.clone(),
+        revision: change_set.revision,
+        ready_for_integration,
+        stacks,
+        execution_order,
+    })
 }
 
 /// Derive a review only from evidence captured for one session.  A historical
@@ -1017,6 +2105,7 @@ fn derive_review_plan(
     policy: &orkia_model::RepositoryPolicy,
     checkpoint: String,
 ) -> Result<Option<ReviewPlan>> {
+    let policy_digest = orkia_model::repository_policy_digest(policy)?;
     let changes = git.changes_since(base_commit)?;
     let scoped_events = session_events(events, session)?;
     let source_events = scoped_events
@@ -1026,13 +2115,32 @@ fn derive_review_plan(
     let atoms = changes
         .iter()
         .flat_map(|change| {
-            extract_atoms(&ChangedFile {
-                path: change.path.clone(),
-                changed_start: change.changed_start,
-                changed_end: change.changed_end,
-                content: change.new_content.clone(),
-                source_events: source_events.clone(),
-            })
+            let path_events = scoped_events
+                .iter()
+                .filter(|event| event_covers_path(&event.unsigned.event, &change.path))
+                .map(|event| event.unsigned.id.clone())
+                .collect::<BTreeSet<_>>();
+            let source_events = if path_events.is_empty() {
+                source_events.clone()
+            } else {
+                path_events
+            };
+            let ranges = changed_line_ranges(&change.old_content, &change.new_content);
+            let ranges = if ranges.is_empty() {
+                vec![(change.changed_start, change.changed_end)]
+            } else {
+                ranges
+            };
+            extract_atoms_in_ranges(
+                &ChangedFile {
+                    path: change.path.clone(),
+                    changed_start: change.changed_start,
+                    changed_end: change.changed_end,
+                    content: change.new_content.clone(),
+                    source_events: source_events.clone(),
+                },
+                &ranges,
+            )
         })
         .collect::<Vec<_>>();
     if atoms.is_empty() {
@@ -1041,6 +2149,7 @@ fn derive_review_plan(
     let coverage_milli = causal_coverage_milli(&changes, &scoped_events);
     Ok(Some(plan(PlanningInput {
         checkpoint,
+        policy_digest: Some(policy_digest),
         dependencies: infer_dependencies(&atoms),
         atoms,
         coverage_milli,
@@ -1050,14 +2159,113 @@ fn derive_review_plan(
     })))
 }
 
+// This is the CLI composition boundary. It deliberately carries the complete
+// capture context needed to atomically publish the derived semantic objects.
+#[allow(clippy::too_many_arguments)]
 fn persist_review_plan(
     root: &Path,
     ledger: &Ledger<orkia_git::GitLedgerStore, SystemClock>,
+    git: &LibGit2Repository,
+    secrets: &FileSecrets,
     plan: &ReviewPlan,
     checkpoint: &str,
+    session: &SessionId,
+    repository: &RepositoryId,
+    base_commit: &str,
+    changes: &[orkia_model::FileChange],
+    repository_path: &Path,
 ) -> Result<()> {
+    let identity = load_identity(root, secrets)?;
+    let policy = load_repository_policy(repository_path)?;
+    // The policy is input to confidence, projection and integration. Bind its
+    // canonical semantic digest into the signed plan before any derived object
+    // is published; a later policy edit must produce a fresh review instead of
+    // silently changing the decision represented by this plan.
+    let mut signed_plan = plan.clone();
+    signed_plan.policy_digest = Some(orkia_model::repository_policy_digest(&policy)?);
+    let plan = &signed_plan;
     let destination = root.join("orkia/plans").join(format!("{}.json", plan.id.0));
     write_json(&destination, plan)?;
+    match git.semantic_store().latest_review_plan(&plan.id, &policy) {
+        Ok(existing) if existing.revision == plan.revision && existing == *plan => {
+            // Hook delivery is at-least-once. The same causal plan has already
+            // been signed and published, so replaying it must not manufacture
+            // StackPullRequest or stack revisions.
+            return Ok(());
+        }
+        Ok(existing) if existing.revision == plan.revision => {
+            return Err(OrkiaError::Integrity(format!(
+                "review plan {} revision {} is already bound to different content",
+                existing.id.0, existing.revision
+            )));
+        }
+        Ok(_) | Err(OrkiaError::NotFound(_)) => {}
+        Err(error) => return Err(error),
+    }
+    git.semantic_store().store_review_plan(plan, &identity)?;
+    let mut pull_requests = orkia_changesets::from_review_plan(
+        plan,
+        session.clone(),
+        repository.clone(),
+        base_commit.into(),
+    )?;
+    for pull_request in &mut pull_requests {
+        orkia_projection::bind_patches(pull_request, changes)?;
+        if let Some((previous, current)) = git
+            .semantic_store()
+            .latest_stack_pull_request(&pull_request.id, &policy)?
+        {
+            pull_request.revision = current.revision + 1;
+            pull_request.status = orkia_model::StackPullRequestStatus::Active;
+            pull_request.supersedes = Some(previous);
+        } else {
+            pull_request.status = orkia_model::StackPullRequestStatus::Active;
+        }
+        let object = git
+            .semantic_store()
+            .store_stack_pull_request(pull_request, &identity)?;
+        ledger.append(CaptureEvent::StackPullRequestPublished {
+            pull_request: pull_request.id.clone(),
+            revision: pull_request.revision,
+            object,
+        })?;
+    }
+    let mut stack = orkia_changesets::stack(&pull_requests)?;
+    if let Some((previous, current)) = git.semantic_store().latest_stack(&stack.id, &policy)? {
+        if current.pull_requests != stack.pull_requests
+            || current.pull_request_revisions != stack.pull_request_revisions
+            || current.roots != stack.roots
+        {
+            stack.revision = current.revision + 1;
+            stack.supersedes = Some(previous);
+        } else {
+            stack = current;
+        }
+    }
+    git.semantic_store().store_stack(&stack, &identity)?;
+    let mut change_set = orkia_changesets::change_set(std::slice::from_ref(&stack))?;
+    if let Some((previous, current)) = git
+        .semantic_store()
+        .latest_changeset(&change_set.id, &policy)?
+    {
+        if current.stacks != change_set.stacks
+            || current.depends_on != change_set.depends_on
+            || current.status != change_set.status
+        {
+            change_set.revision = current.revision + 1;
+            change_set.supersedes = Some(previous);
+        } else {
+            change_set = current;
+        }
+    }
+    let object = git
+        .semantic_store()
+        .store_changeset(&change_set, &identity)?;
+    ledger.append(CaptureEvent::ChangeSetPublished {
+        changeset: change_set.id,
+        revision: change_set.revision,
+        object,
+    })?;
     ledger.append(CaptureEvent::ReviewPlanCreated {
         plan: plan.id.clone(),
         checkpoint: checkpoint.into(),
@@ -1070,11 +2278,153 @@ fn persist_review_plan(
 fn load_repository_policy(repository: &Path) -> Result<orkia_model::RepositoryPolicy> {
     let path = repository.join("orkia.toml");
     if path.exists() {
-        orkia_policy::load(&path)
+        let content = fs::read_to_string(&path)
+            .map_err(|error| OrkiaError::NotFound(format!("{}: {error}", path.display())))?;
+        orkia_policy::parse(&content)
     } else {
         Ok(orkia_model::RepositoryPolicy::default())
     }
 }
+
+/// The worktree copy is only a user-facing lookup by ID. Decisions always use
+/// the newest revision whose bytes and signature are present in Git refs.
+fn signed_review_plan(
+    root: &Path,
+    git: &LibGit2Repository,
+    repository: &Path,
+    plan_id: &str,
+) -> Result<ReviewPlan> {
+    let local = root.join("orkia/plans").join(format!("{plan_id}.json"));
+    let id = if local.exists() {
+        read_json::<ReviewPlan>(&local)?.id
+    } else {
+        plan_id
+            .parse::<uuid::Uuid>()
+            .map(orkia_model::PlanId)
+            .map_err(|error| OrkiaError::Invalid(format!("invalid review plan id: {error}")))?
+    };
+    let policy = load_repository_policy(repository)?;
+    let plan = git.semantic_store().latest_review_plan(&id, &policy)?;
+    let expected_policy = orkia_model::repository_policy_digest(&policy)?;
+    if plan.policy_digest.as_deref() != Some(expected_policy.as_str()) {
+        return Err(OrkiaError::Policy(format!(
+            "signed review plan {} was created under a different repository policy; create a new review plan",
+            plan.id.0
+        )));
+    }
+    Ok(plan)
+}
+
+fn persist_revised_plan(
+    root: &Path,
+    git: &LibGit2Repository,
+    repository: &Path,
+    secrets: &FileSecrets,
+    revised: &ReviewPlan,
+    reason: &str,
+) -> Result<()> {
+    let events = git.ledger_store().read_all()?;
+    let (session, base, repository_id) = plan_session_context(&events, revised)?;
+    let changes = git.changes_since(&base)?;
+    let ledger = open_repository_ledger(git, root, secrets)?;
+    persist_review_plan(
+        root,
+        &ledger,
+        git,
+        secrets,
+        revised,
+        &revised.source_checkpoint,
+        &session,
+        &repository_id,
+        &base,
+        &changes,
+        repository,
+    )?;
+    match revised.status {
+        orkia_model::PlanStatus::Approved => ledger.append(CaptureEvent::ReviewPlanApproved {
+            plan: revised.id.clone(),
+            revision: revised.revision,
+        })?,
+        orkia_model::PlanStatus::ChangesRequested => {
+            ledger.append(CaptureEvent::ReviewPlanChangesRequested {
+                plan: revised.id.clone(),
+                revision: revised.revision,
+                reason: reason.into(),
+            })?
+        }
+        _ => ledger.append(CaptureEvent::ReviewPlanRevised {
+            plan: revised.id.clone(),
+            revision: revised.revision,
+            reason: reason.into(),
+        })?,
+    };
+    Ok(())
+}
+
+/// Resolve the immutable causal session that produced a plan.  A reviewer may
+/// correct a plan after another session has started; using the latest global
+/// session here would rebind the correction to unrelated files and evidence.
+fn plan_session_context(
+    events: &[orkia_model::LedgerEvent],
+    plan: &ReviewPlan,
+) -> Result<(SessionId, String, RepositoryId)> {
+    if let Some((session, base_commit, repository)) = events.iter().find_map(|event| {
+        if !plan.created_from.contains(&event.unsigned.id) {
+            return None;
+        }
+        match &event.unsigned.event {
+            CaptureEvent::SessionStarted {
+                session,
+                base_commit,
+                ..
+            } => Some((
+                session.clone(),
+                base_commit.clone(),
+                event.unsigned.repository.clone(),
+            )),
+            _ => None,
+        }
+    }) {
+        return Ok((session, base_commit, repository));
+    }
+
+    // Plans imported from an older schema may not carry `created_from`.  Their
+    // checkpoint embeds the signed Checkpoint event id (`<commit>#<uuid>`),
+    // which still lets us recover the session by walking backward in the
+    // immutable ledger.  If that evidence is absent, fail closed instead of
+    // guessing from the newest session.
+    let checkpoint_event = plan
+        .source_checkpoint
+        .rsplit_once('#')
+        .and_then(|(_, id)| id.parse::<uuid::Uuid>().ok())
+        .map(orkia_model::EventId);
+    let checkpoint_index =
+        checkpoint_event.and_then(|id| events.iter().position(|event| event.unsigned.id == id));
+    if let Some(index) = checkpoint_index {
+        for event in events[..=index].iter().rev() {
+            if let CaptureEvent::SessionStarted {
+                session,
+                base_commit,
+                ..
+            } = &event.unsigned.event
+            {
+                return Ok((
+                    session.clone(),
+                    base_commit.clone(),
+                    event.unsigned.repository.clone(),
+                ));
+            }
+            if matches!(event.unsigned.event, CaptureEvent::SessionClosed { .. }) {
+                break;
+            }
+        }
+    }
+    Err(OrkiaError::Integrity(format!(
+        "review plan {} has no recoverable source session evidence",
+        plan.id.0
+    )))
+}
+
 fn open_ledger(
     git: &LibGit2Repository,
     root: &Path,
@@ -1169,11 +2519,23 @@ fn session_events<'a>(
             )
         })
         .ok_or_else(|| OrkiaError::NotFound(format!("session {}", session.0)))?;
-    Ok(events[start..].iter().collect())
+    let end = events
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(index, event)| match &event.unsigned.event {
+            CaptureEvent::SessionClosed { session: closed } if closed == session => Some(index),
+            CaptureEvent::SessionStarted {
+                session: started, ..
+            } if started != session => Some(index),
+            _ => None,
+        })
+        .unwrap_or(events.len());
+    Ok(events[start..end].iter().collect())
 }
 
 fn causal_coverage_milli(
-    changes: &[orkia_git::WorkingFileChange],
+    changes: &[orkia_model::FileChange],
     events: &[&orkia_model::LedgerEvent],
 ) -> u16 {
     let observed = events
@@ -1189,15 +2551,26 @@ fn causal_coverage_milli(
         })
         .collect::<BTreeSet<_>>();
     let every_change_observed = changes.iter().all(|change| observed.contains(&change.path));
-    let unknown_write = events.iter().any(|event| {
-        matches!(
-            event.unsigned.event,
-            CaptureEvent::FilesObserved {
-                unknown_write: true,
-                ..
+    // A watcher may report a write before `orkia run` records the command
+    // that mediated it. Treat the path as unknown until a later typed
+    // observation closes it; an unrelated human/editor write remains a hard
+    // coverage failure at checkpoint time.
+    let mut unknown_paths = BTreeSet::new();
+    for event in events {
+        if let CaptureEvent::FilesObserved {
+            modified,
+            unknown_write,
+            ..
+        } = &event.unsigned.event
+        {
+            if *unknown_write {
+                unknown_paths.extend(modified.iter().cloned());
+            } else {
+                unknown_paths.retain(|path| !modified.contains(path));
             }
-        )
-    });
+        }
+    }
+    let unknown_write = !unknown_paths.is_empty();
     let unbound_agent_action = events.iter().any(|event| {
         matches!(
             event.unsigned.event,
@@ -1208,6 +2581,41 @@ fn causal_coverage_milli(
         1000
     } else {
         0
+    }
+}
+
+/// Returns whether a captured event names one concrete repository path.  The
+/// causal evidence attached to an atom is intentionally path-scoped; falling
+/// back to the whole session remains the conservative behavior only when no
+/// provider exposed a path for that file.
+fn event_covers_path(event: &CaptureEvent, path: &str) -> bool {
+    fn matches_path(candidate: &str, path: &str) -> bool {
+        candidate == path || candidate.ends_with(&format!("/{path}"))
+    }
+    match event {
+        CaptureEvent::AgentAction {
+            action:
+                orkia_model::AgentActionKind::FileRead {
+                    path: candidate, ..
+                }
+                | orkia_model::AgentActionKind::FileWrite {
+                    path: candidate, ..
+                },
+            ..
+        } => matches_path(candidate, path),
+        CaptureEvent::FilesObserved { read, modified, .. } => read
+            .iter()
+            .chain(modified.iter())
+            .any(|candidate| matches_path(candidate, path)),
+        CaptureEvent::AgentSessionSnapshot {
+            changed_paths,
+            observed_paths,
+            ..
+        } => changed_paths
+            .iter()
+            .chain(observed_paths.iter())
+            .any(|candidate| matches_path(candidate, path)),
+        _ => false,
     }
 }
 
@@ -1369,6 +2777,124 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_a_cross_repository_stack_reference() {
+        let repository = RepositoryId::new();
+        let stack = StackId::new();
+        let parsed =
+            parse_changeset_stack_reference(&format!("{}:{}", repository.0, stack.0)).unwrap();
+        assert_eq!(parsed.repository, repository);
+        assert_eq!(parsed.stack, stack);
+        assert!(parse_changeset_stack_reference("not-a-reference").is_err());
+    }
+
+    #[test]
+    fn parses_only_absolute_repository_locations_for_changesets() {
+        let repository = RepositoryId::new();
+        let (parsed, path) =
+            parse_changeset_repository_path(&format!("{}=/tmp/orkia-stack", repository.0)).unwrap();
+        assert_eq!(parsed, repository);
+        assert_eq!(path, PathBuf::from("/tmp/orkia-stack"));
+        assert!(parse_changeset_repository_path(&format!("{}=relative", repository.0)).is_err());
+    }
+
+    #[test]
+    fn watcher_unknown_write_is_closed_by_a_later_mediated_observation() {
+        let changes = vec![orkia_model::FileChange {
+            path: "src/lib.rs".into(),
+            old_content: "old".into(),
+            new_content: "new".into(),
+            changed_start: 1,
+            changed_end: 1,
+        }];
+        let events = [
+            ledger_event(CaptureEvent::FilesObserved {
+                read: BTreeSet::new(),
+                modified: BTreeSet::from(["src/lib.rs".into()]),
+                unknown_write: true,
+            }),
+            ledger_event(CaptureEvent::FilesObserved {
+                read: BTreeSet::new(),
+                modified: BTreeSet::from(["src/lib.rs".into()]),
+                unknown_write: false,
+            }),
+        ];
+        let references = events.iter().collect::<Vec<_>>();
+        assert_eq!(causal_coverage_milli(&changes, &references), 1000);
+    }
+
+    #[test]
+    fn session_event_scope_stops_at_close_or_the_next_concurrent_session() {
+        let first = SessionId::new();
+        let second = SessionId::new();
+        let events = vec![
+            ledger_event(CaptureEvent::SessionStarted {
+                session: first.clone(),
+                origin: CaptureOrigin::Human,
+                base_commit: "a".repeat(40),
+                objective: "first".into(),
+            }),
+            ledger_event(CaptureEvent::FilesObserved {
+                read: BTreeSet::new(),
+                modified: BTreeSet::from(["first.rs".into()]),
+                unknown_write: false,
+            }),
+            ledger_event(CaptureEvent::SessionStarted {
+                session: second.clone(),
+                origin: CaptureOrigin::Human,
+                base_commit: "b".repeat(40),
+                objective: "second".into(),
+            }),
+            ledger_event(CaptureEvent::FilesObserved {
+                read: BTreeSet::new(),
+                modified: BTreeSet::from(["second.rs".into()]),
+                unknown_write: false,
+            }),
+        ];
+        let scoped = session_events(&events, &first).unwrap();
+        assert_eq!(scoped.len(), 2);
+        assert!(matches!(
+            scoped[1].unsigned.event,
+            CaptureEvent::FilesObserved { .. }
+        ));
+    }
+
+    #[test]
+    fn plan_correction_uses_its_source_session_after_a_new_session_starts() {
+        let first = SessionId::new();
+        let second = SessionId::new();
+        let first_started = ledger_event(CaptureEvent::SessionStarted {
+            session: first.clone(),
+            origin: CaptureOrigin::Human,
+            base_commit: "a".repeat(40),
+            objective: "first".into(),
+        });
+        let second_started = ledger_event(CaptureEvent::SessionStarted {
+            session: second,
+            origin: CaptureOrigin::Human,
+            base_commit: "b".repeat(40),
+            objective: "second".into(),
+        });
+        let plan = ReviewPlan {
+            schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
+            id: orkia_model::PlanId::new(),
+            revision: 0,
+            source_checkpoint: format!("{}#{}", "a".repeat(40), first_started.unsigned.id.0),
+            policy_digest: None,
+            units: Vec::new(),
+            atom_paths: BTreeMap::new(),
+            atoms: Vec::new(),
+            coverage_milli: 1000,
+            status: orkia_model::PlanStatus::Proposed,
+            created_from: BTreeSet::from([first_started.unsigned.id.clone()]),
+        };
+        let events = vec![first_started.clone(), second_started];
+        let (session, base, repository) = plan_session_context(&events, &plan).unwrap();
+        assert_eq!(session, first);
+        assert_eq!(base, "a".repeat(40));
+        assert_eq!(repository, first_started.unsigned.repository);
+    }
+
     fn initialized_session_repository(
         temp: &tempfile::TempDir,
     ) -> (PathBuf, LibGit2Repository, PathBuf, FileSecrets, Identity) {
@@ -1445,14 +2971,133 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(plans.len(), 1);
         let plan: ReviewPlan = read_json(&plans[0]).unwrap();
+        let plan_path = plans[0].clone();
         assert_eq!(plan.coverage_milli, 1000);
         assert!(
             !plan.atoms.is_empty(),
             "semantic atoms are persisted with the plan"
         );
+        let pull_requests = git
+            .semantic_store()
+            .stack_pull_requests_for_plan(&plan, &orkia_model::RepositoryPolicy::default())
+            .unwrap();
+        assert_eq!(pull_requests.len(), 1);
+        assert!(
+            !pull_requests[0].patches.is_empty(),
+            "the authoritative stack pull request carries exact projection patches"
+        );
+        handle_review(
+            ReviewCommand::Project {
+                plan: plan.id.0.to_string(),
+            },
+            &git,
+            &root,
+            &repository,
+            &secrets,
+        )
+        .unwrap();
+        let git_repository = git2::Repository::open(&repository).unwrap();
+        let projected = git_repository
+            .find_reference(&format!(
+                "refs/heads/orkia/stack-pr/{}",
+                pull_requests[0].id.0.simple()
+            ))
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        let entry = projected
+            .tree()
+            .unwrap()
+            .get_path(Path::new("src/lib.rs"))
+            .unwrap();
+        let body = git_repository
+            .find_blob(entry.id())
+            .unwrap()
+            .content()
+            .to_vec();
+        assert_eq!(body, b"pub fn feature() {}\n");
+        let repository_id: RepositoryId = read_json(&root.join("orkia/repository.json")).unwrap();
+        let (projected_object, projected) = git
+            .semantic_store()
+            .latest_projection_for_stack_pull_request_revision(
+                &pull_requests[0].id,
+                pull_requests[0].revision,
+                &orkia_model::RepositoryPolicy::default(),
+            )
+            .unwrap()
+            .unwrap();
+        let mut published = projected;
+        published.revision += 1;
+        published.forge_pull_request = Some("https://forge.test/pr/1".into());
+        published.status = orkia_model::ProjectionStatus::Published;
+        published.supersedes = Some(projected_object);
+        git.semantic_store()
+            .store_projection(&published, &identity)
+            .unwrap();
+        let stack_id =
+            orkia_model::StackId::from_stack_pull_requests([pull_requests[0].id.clone()]);
+        let (_, stack) = git
+            .semantic_store()
+            .latest_stack(&stack_id, &orkia_model::RepositoryPolicy::default())
+            .unwrap()
+            .unwrap();
+        let changeset_id =
+            orkia_model::ChangeSetId::from_stack_references([orkia_model::ChangeSetStack {
+                repository: repository_id.clone(),
+                stack: stack.id,
+                revision: stack.revision,
+            }]);
+        let (_, changeset) = git
+            .semantic_store()
+            .latest_changeset(&changeset_id, &orkia_model::RepositoryPolicy::default())
+            .unwrap()
+            .unwrap();
+        handle_changeset_integration(
+            &changeset.id.0.to_string(),
+            &[format!("{}={}", repository_id.0, repository.display())],
+            "feature",
+            0,
+            &git,
+            &repository,
+        )
+        .unwrap();
+        assert!(matches!(
+            git.semantic_store()
+                .latest_changeset(&changeset.id, &orkia_model::RepositoryPolicy::default())
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            orkia_model::StackPullRequestStatus::Integrated
+        ));
         assert!(git.ledger_store().read_all().unwrap().iter().any(|event| {
             matches!(event.unsigned.event, CaptureEvent::ReviewPlanCreated { .. })
         }));
+        std::fs::remove_file(plan_path).unwrap();
+        let reconstructed =
+            signed_review_plan(&root, &git, &repository, &plan.id.0.to_string()).unwrap();
+        assert_eq!(
+            reconstructed, plan,
+            "signed refs replace the worktree cache"
+        );
+        std::fs::write(
+            repository.join("orkia.toml"),
+            r#"protected_branches = ["main"]
+validation_commands = []
+minimum_coverage_milli = 950
+minimum_confidence_milli = 800
+required_approvals = 2
+required_checks = ["orkia/integrate"]
+minimum_semantic_signatures = 1
+authorized_grant_issuers = []
+revoked_grants = []
+"#,
+        )
+        .unwrap();
+        assert!(
+            signed_review_plan(&root, &git, &repository, &plan.id.0.to_string()).is_err(),
+            "a changed policy must not reinterpret a previously signed plan"
+        );
         let events = git.ledger_store().read_all().unwrap();
         let actors = BTreeMap::from([(identity.actor().id.clone(), identity.actor().clone())]);
         verify_chain(&events, &actors).unwrap();

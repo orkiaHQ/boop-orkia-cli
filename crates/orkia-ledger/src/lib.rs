@@ -124,13 +124,13 @@ impl LedgerStore for MemoryLedgerStore {
 
 pub struct FixedClock(pub time::OffsetDateTime);
 impl Clock for FixedClock {
-    fn now(&self) -> time::OffsetDateTime {
+    fn now(&self) -> orkia_model::Timestamp {
         self.0
     }
 }
 pub struct SystemClock;
 impl Clock for SystemClock {
-    fn now(&self) -> time::OffsetDateTime {
+    fn now(&self) -> orkia_model::Timestamp {
         time::OffsetDateTime::now_utc()
     }
 }

@@ -11,6 +11,11 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub struct PlanningInput {
     pub checkpoint: String,
+    /// The canonical repository-policy digest used for this decision. It is
+    /// part of the deterministic plan identity so a policy change cannot
+    /// collide with an earlier plan before persistence binds the same digest
+    /// into the signed document.
+    pub policy_digest: Option<String>,
     pub atoms: Vec<ChangeAtom>,
     pub dependencies: Vec<AtomDependency>,
     pub coverage_milli: u16,
@@ -83,9 +88,10 @@ pub fn plan(input: PlanningInput) -> ReviewPlan {
         .collect();
     ReviewPlan {
         schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
-        id: deterministic_plan(&input.checkpoint, 0),
+        id: deterministic_plan(&input),
         revision: 0,
         source_checkpoint: input.checkpoint,
+        policy_digest: input.policy_digest.clone(),
         units,
         atom_paths,
         atoms: input.atoms,
@@ -185,8 +191,25 @@ pub fn apply_correction(plan: &ReviewPlan, correction: ReviewerCorrection) -> Re
             }
         }
     }
-    next.id = deterministic_plan(&next.source_checkpoint, next.revision);
+    // A correction is a revision of the same review decision. The stable
+    // plan ID is intentionally preserved; consumers select the revision
+    // explicitly and never confuse it with an unrelated automatic plan.
     next.units.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(next)
+}
+
+/// Creates a signed-plan successor for a reviewer decision that does not
+/// alter the partition. The stable plan ID remains unchanged; only its
+/// revision and lifecycle state advance.
+pub fn set_status(plan: &ReviewPlan, status: PlanStatus) -> Result<ReviewPlan> {
+    if matches!(status, PlanStatus::Superseded) {
+        return Err(OrkiaError::Invalid(
+            "use an explicit successor plan to mark a review plan superseded".into(),
+        ));
+    }
+    let mut next = plan.clone();
+    next.revision += 1;
+    next.status = status;
     Ok(next)
 }
 
@@ -199,9 +222,10 @@ fn one_unit_plan(input: &PlanningInput, confidence: u16) -> ReviewPlan {
         .collect();
     ReviewPlan {
         schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
-        id: deterministic_plan(&input.checkpoint, 0),
+        id: deterministic_plan(input),
         revision: 0,
         source_checkpoint: input.checkpoint.clone(),
+        policy_digest: input.policy_digest.clone(),
         units: vec![ReviewUnit {
             id: deterministic_unit(&atoms),
             title: "Single review: insufficient causal coverage".into(),
@@ -257,7 +281,7 @@ fn confidence(deps: &[AtomDependency], atom_count: usize) -> u16 {
         return 0;
     }
     if deps.is_empty() {
-        return 850;
+        850
     } else {
         (deps.iter().map(|d| d.confidence_milli as u32).sum::<u32>() / deps.len() as u32) as u16
     }
@@ -273,8 +297,21 @@ fn deterministic_unit(atoms: &BTreeSet<AtomId>) -> ReviewUnitId {
     bytes.copy_from_slice(&digest[..16]);
     ReviewUnitId(Uuid::from_bytes(bytes))
 }
-fn deterministic_plan(checkpoint: &str, revision: u32) -> PlanId {
-    let digest = Sha256::digest(format!("{checkpoint}:{revision}").as_bytes());
+fn deterministic_plan(input: &PlanningInput) -> PlanId {
+    let mut bytes = input.checkpoint.as_bytes().to_vec();
+    bytes.push(0);
+    if let Some(policy_digest) = &input.policy_digest {
+        bytes.extend_from_slice(policy_digest.as_bytes());
+    }
+    bytes.push(0);
+    for atom in &input.atoms {
+        bytes.extend_from_slice(atom.id.0.as_bytes());
+    }
+    bytes.push(0);
+    for event in &input.source_events {
+        bytes.extend_from_slice(event.0.as_bytes());
+    }
+    let digest = Sha256::digest(bytes);
     let mut bytes = [0; 16];
     bytes.copy_from_slice(&digest[..16]);
     PlanId(Uuid::from_bytes(bytes))
@@ -312,6 +349,7 @@ mod tests {
     fn incomplete_capture_never_splits() {
         let input = PlanningInput {
             checkpoint: "x".into(),
+            policy_digest: None,
             atoms: vec![atom(), atom()],
             dependencies: vec![],
             coverage_milli: 0,
@@ -320,5 +358,74 @@ mod tests {
             source_events: BTreeSet::<EventId>::new(),
         };
         assert_eq!(plan(input).units.len(), 1);
+    }
+
+    #[test]
+    fn reviewer_correction_keeps_the_stable_plan_identity() {
+        let first = atom();
+        let second = atom();
+        let input = PlanningInput {
+            checkpoint: "x".into(),
+            policy_digest: None,
+            atoms: vec![first, second],
+            dependencies: vec![],
+            coverage_milli: 0,
+            minimum_coverage_milli: 950,
+            minimum_confidence_milli: 800,
+            source_events: BTreeSet::new(),
+        };
+        let plan = plan(input);
+        let revised = apply_correction(
+            &plan,
+            ReviewerCorrection::Split {
+                unit: plan.units[0].id.clone(),
+                groups: vec![
+                    BTreeSet::from([plan.atoms[0].id.clone()]),
+                    BTreeSet::from([plan.atoms[1].id.clone()]),
+                ],
+                reason: "test".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(revised.id, plan.id);
+        assert_eq!(revised.revision, plan.revision + 1);
+    }
+
+    #[test]
+    fn approval_revises_without_changing_the_partition() {
+        let input = PlanningInput {
+            checkpoint: "x".into(),
+            policy_digest: None,
+            atoms: vec![atom()],
+            dependencies: vec![],
+            coverage_milli: 0,
+            minimum_coverage_milli: 950,
+            minimum_confidence_milli: 800,
+            source_events: BTreeSet::new(),
+        };
+        let plan = plan(input);
+        let approved = set_status(&plan, PlanStatus::Approved).unwrap();
+        assert_eq!(approved.id, plan.id);
+        assert_eq!(approved.units, plan.units);
+        assert_eq!(approved.status, PlanStatus::Approved);
+    }
+
+    #[test]
+    fn policy_digest_is_part_of_the_automatic_plan_identity() {
+        let base = PlanningInput {
+            checkpoint: "x".into(),
+            policy_digest: Some("a".into()),
+            atoms: vec![atom()],
+            dependencies: vec![],
+            coverage_milli: 1000,
+            minimum_coverage_milli: 0,
+            minimum_confidence_milli: 0,
+            source_events: BTreeSet::new(),
+        };
+        let mut changed = base.clone();
+        changed.policy_digest = Some("b".into());
+        let base_plan = plan(base);
+        assert_eq!(base_plan.policy_digest.as_deref(), Some("a"));
+        assert_ne!(base_plan.id, plan(changed).id);
     }
 }

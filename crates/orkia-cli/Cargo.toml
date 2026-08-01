@@ -3,6 +3,7 @@ name = "orkia-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "orkia"
@@ -13,6 +14,7 @@ clap.workspace = true
 base64.workspace = true
 git2.workspace = true
 orkia-capture = { path = "../orkia-capture" }
+orkia-changesets = { path = "../orkia-changesets" }
 orkia-agents = { path = "../orkia-agents" }
 orkia-forge = { path = "../orkia-forge" }
 orkia-github = { path = "../orkia-github" }
@@ -23,6 +25,7 @@ orkia-ledger = { path = "../orkia-ledger" }
 orkia-model = { path = "../orkia-model" }
 orkia-ports = { path = "../orkia-ports" }
 orkia-policy = { path = "../orkia-policy" }
+orkia-projection = { path = "../orkia-projection" }
 orkia-review = { path = "../orkia-review" }
 orkia-semantic = { path = "../orkia-semantic" }
 serde.workspace = true

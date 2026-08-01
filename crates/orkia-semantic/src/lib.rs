@@ -63,27 +63,55 @@ pub struct ChangedFile {
 }
 
 pub fn extract_atoms(file: &ChangedFile) -> Vec<ChangeAtom> {
+    extract_atoms_in_ranges(file, &[(file.changed_start, file.changed_end)])
+}
+
+/// Extracts semantic boundaries that overlap at least one concrete changed
+/// line range.  Git's compact `changed_start..changed_end` envelope is useful
+/// for compatibility, but it can include an unchanged symbol between two
+/// distant hunks; callers with a real diff should use this function so that
+/// such symbols never become review units accidentally.
+pub fn extract_atoms_in_ranges(
+    file: &ChangedFile,
+    changed_ranges: &[(u32, u32)],
+) -> Vec<ChangeAtom> {
+    if let Some(kind) = path_atom_kind(&file.path) {
+        return vec![hunk_atom_kind(file, kind)];
+    }
     let language = Language::from_path(&file.path);
     let mut parser = Parser::new();
     let Some(grammar) = language.grammar() else {
-        return vec![hunk_atom(file)];
+        return vec![hunk_atom_kind(file, AtomKind::Hunk)];
     };
     if parser.set_language(&grammar).is_err() {
-        return vec![hunk_atom(file)];
+        return vec![hunk_atom_kind(file, AtomKind::Hunk)];
     }
     let Some(tree) = parser.parse(&file.content, None) else {
-        return vec![hunk_atom(file)];
+        return vec![hunk_atom_kind(file, AtomKind::Hunk)];
     };
     let mut nodes = Vec::new();
     collect_named(&mut tree.walk(), &mut nodes);
+    let block_node = nodes
+        .iter()
+        .find(|node| {
+            let range = node.range();
+            let start = range.start_point.row as u32 + 1;
+            let end = range.end_point.row as u32 + 1;
+            is_block_boundary(node.kind())
+                && changed_ranges.iter().any(|(changed_start, changed_end)| {
+                    end >= *changed_start && start <= *changed_end
+                })
+        })
+        .copied();
     let mut atoms: Vec<_> = nodes
         .into_iter()
         .filter_map(|node| {
             let range = node.range();
             let start = range.start_point.row as u32 + 1;
             let end = range.end_point.row as u32 + 1;
-            if end < file.changed_start
-                || start > file.changed_end
+            if !changed_ranges
+                .iter()
+                .any(|(changed_start, changed_end)| end >= *changed_start && start <= *changed_end)
                 || !is_review_boundary(node.kind())
             {
                 return None;
@@ -107,13 +135,101 @@ pub fn extract_atoms(file: &ChangedFile) -> Vec<ChangeAtom> {
         })
         .collect();
     if atoms.is_empty() {
-        atoms.push(hunk_atom(file));
+        if let Some(node) = block_node {
+            let range = node.range();
+            let start = range.start_point.row as u32 + 1;
+            let end = range.end_point.row as u32 + 1;
+            let text = node.utf8_text(file.content.as_bytes()).unwrap_or_default();
+            atoms.push(atom(
+                file,
+                AtomKind::Block,
+                symbol_name(text, node.kind()),
+                start,
+                end,
+                text,
+            ));
+        } else {
+            atoms.push(hunk_atom_kind(file, AtomKind::Hunk));
+        }
     }
     atoms.sort_by(|a, b| {
         (a.start_line, &a.path, &a.content_hash).cmp(&(b.start_line, &b.path, &b.content_hash))
     });
     stabilize_symbol_atom_ids(&mut atoms);
     atoms
+}
+
+/// Returns the new-file line ranges touched by a line diff.  It is deliberately
+/// conservative for deletions: a deletion with no surviving new line is
+/// anchored at the nearest surviving line so a surrounding semantic symbol is
+/// still reviewable.  The ranges are deterministic and disjoint.
+pub fn changed_line_ranges(old: &str, new: &str) -> Vec<(u32, u32)> {
+    let old = old.split_inclusive('\n').collect::<Vec<_>>();
+    let new = new.split_inclusive('\n').collect::<Vec<_>>();
+    if old == new {
+        return Vec::new();
+    }
+    if old.is_empty() {
+        return if new.is_empty() {
+            Vec::new()
+        } else {
+            vec![(1, new.len() as u32)]
+        };
+    }
+    if new.is_empty() {
+        return vec![(1, 1)];
+    }
+    let mut lcs = vec![vec![0_usize; new.len() + 1]; old.len() + 1];
+    for old_index in (0..old.len()).rev() {
+        for new_index in (0..new.len()).rev() {
+            lcs[old_index][new_index] = if old[old_index] == new[new_index] {
+                lcs[old_index + 1][new_index + 1] + 1
+            } else {
+                lcs[old_index + 1][new_index].max(lcs[old_index][new_index + 1])
+            };
+        }
+    }
+    let (mut old_index, mut new_index) = (0_usize, 0_usize);
+    let mut ranges = Vec::<(u32, u32)>::new();
+    while old_index < old.len() || new_index < new.len() {
+        if old_index < old.len() && new_index < new.len() && old[old_index] == new[new_index] {
+            old_index += 1;
+            new_index += 1;
+            continue;
+        }
+        let start_new = new_index;
+        while old_index < old.len() && new_index < new.len() && old[old_index] != new[new_index] {
+            // Prefer consuming a new line on a tie. This makes an insertion
+            // between two unchanged lines stay a one-line range instead of
+            // swallowing the unchanged successor as well; deletions still
+            // win when the LCS score proves that the old line is unmatched.
+            if lcs[old_index + 1][new_index] > lcs[old_index][new_index + 1] {
+                old_index += 1;
+            } else {
+                new_index += 1;
+            }
+        }
+        if old_index == old.len() {
+            new_index = new.len();
+        } else if new_index == new.len() {
+            old_index = old.len();
+        }
+        let end_new = new_index;
+        let anchor = start_new.min(new.len().saturating_sub(1));
+        let range = if end_new > start_new {
+            (start_new as u32 + 1, end_new as u32)
+        } else {
+            (anchor as u32 + 1, anchor as u32 + 1)
+        };
+        if let Some((_, previous_end)) = ranges.last_mut()
+            && range.0 <= *previous_end + 1
+        {
+            *previous_end = (*previous_end).max(range.1);
+        } else {
+            ranges.push(range);
+        }
+    }
+    ranges
 }
 
 /// Builds the Git-native Trunk → Branch → Leaf overlay for one analysed file.
@@ -186,13 +302,17 @@ pub fn extract_trunk(
                 .iter()
                 .map(|leaf| leaf.id.clone())
                 .collect::<BTreeSet<_>>();
-            leaves.extend(old_branch.leaves.iter().filter_map(|leaf| {
-                (!current_leaf_ids.contains(&leaf.id)).then(|| SemanticLeaf {
-                    id: leaf.id.clone(),
-                    state: SemanticNodeState::Deleted,
-                    text_hash: leaf.text_hash.clone(),
-                })
-            }));
+            leaves.extend(
+                old_branch
+                    .leaves
+                    .iter()
+                    .filter(|leaf| !current_leaf_ids.contains(&leaf.id))
+                    .map(|leaf| SemanticLeaf {
+                        id: leaf.id.clone(),
+                        state: SemanticNodeState::Deleted,
+                        text_hash: leaf.text_hash.clone(),
+                    }),
+            );
         }
         branches.push(SemanticBranch {
             id: branch_id,
@@ -206,22 +326,26 @@ pub fn extract_trunk(
         .map(|branch| branch.id.clone())
         .collect::<BTreeSet<_>>();
     if let Some(previous) = previous {
-        branches.extend(previous.branches.iter().filter_map(|branch| {
-            (!current_branch_ids.contains(&branch.id)).then(|| SemanticBranch {
-                id: branch.id.clone(),
-                state: SemanticNodeState::Deleted,
-                source_hash: branch.source_hash.clone(),
-                leaves: branch
-                    .leaves
-                    .iter()
-                    .map(|leaf| SemanticLeaf {
-                        id: leaf.id.clone(),
-                        state: SemanticNodeState::Deleted,
-                        text_hash: leaf.text_hash.clone(),
-                    })
-                    .collect(),
-            })
-        }));
+        branches.extend(
+            previous
+                .branches
+                .iter()
+                .filter(|branch| !current_branch_ids.contains(&branch.id))
+                .map(|branch| SemanticBranch {
+                    id: branch.id.clone(),
+                    state: SemanticNodeState::Deleted,
+                    source_hash: branch.source_hash.clone(),
+                    leaves: branch
+                        .leaves
+                        .iter()
+                        .map(|leaf| SemanticLeaf {
+                            id: leaf.id.clone(),
+                            state: SemanticNodeState::Deleted,
+                            text_hash: leaf.text_hash.clone(),
+                        })
+                        .collect(),
+                }),
+        );
     }
     branches.sort_by(|left, right| left.id.cmp(&right.id));
     SemanticTrunk {
@@ -264,6 +388,27 @@ fn source_for_atom(file: &ChangedFile, atom: &ChangeAtom) -> String {
 /// projection boundary; test atoms then depend on implementation atoms.
 pub fn infer_dependencies(atoms: &[ChangeAtom]) -> Vec<AtomDependency> {
     let mut output = Vec::new();
+    // A single captured action can legitimately touch several semantic atoms
+    // (for example one apply_patch call edits two files). Keep that causal
+    // signal soft: it informs confidence without fabricating Git parentage or
+    // forcing independent atoms into one hard component.
+    for (index, left) in atoms.iter().enumerate() {
+        for right in atoms.iter().skip(index + 1) {
+            if left
+                .source_events
+                .intersection(&right.source_events)
+                .next()
+                .is_some()
+            {
+                output.push(AtomDependency {
+                    from: left.id.clone(),
+                    to: right.id.clone(),
+                    kind: DependencyKind::Causal,
+                    confidence_milli: 700,
+                });
+            }
+        }
+    }
     let mut by_path: BTreeMap<&str, Vec<&ChangeAtom>> = BTreeMap::new();
     for atom in atoms {
         by_path.entry(&atom.path).or_default().push(atom);
@@ -271,12 +416,32 @@ pub fn infer_dependencies(atoms: &[ChangeAtom]) -> Vec<AtomDependency> {
     for group in by_path.values() {
         for (index, left) in group.iter().enumerate() {
             for right in group.iter().skip(index + 1) {
-                output.push(AtomDependency {
-                    from: left.id.clone(),
-                    to: right.id.clone(),
-                    kind: DependencyKind::Hard,
-                    confidence_milli: 1000,
-                });
+                if left.start_line <= right.end_line && right.start_line <= left.end_line {
+                    // Nested AST boundaries (for example an impl and a
+                    // method) must stay together because their fragments
+                    // overlap. Disjoint sibling symbols are intentionally
+                    // independent and may become parallel StackPullRequests.
+                    output.push(AtomDependency {
+                        from: left.id.clone(),
+                        to: right.id.clone(),
+                        kind: DependencyKind::Hard,
+                        confidence_milli: 1000,
+                    });
+                } else if left.kind == AtomKind::Import && right.kind != AtomKind::Import {
+                    output.push(AtomDependency {
+                        from: right.id.clone(),
+                        to: left.id.clone(),
+                        kind: DependencyKind::Import,
+                        confidence_milli: 950,
+                    });
+                } else if right.kind == AtomKind::Import && left.kind != AtomKind::Import {
+                    output.push(AtomDependency {
+                        from: left.id.clone(),
+                        to: right.id.clone(),
+                        kind: DependencyKind::Import,
+                        confidence_milli: 950,
+                    });
+                }
             }
         }
     }
@@ -307,11 +472,9 @@ pub fn infer_dependencies(atoms: &[ChangeAtom]) -> Vec<AtomDependency> {
         }
     }
     output.sort_by(|left, right| {
-        (&left.from, &left.to, left.confidence_milli).cmp(&(
-            &right.from,
-            &right.to,
-            right.confidence_milli,
-        ))
+        (&left.from, &left.to)
+            .cmp(&(&right.from, &right.to))
+            .then_with(|| right.confidence_milli.cmp(&left.confidence_milli))
     });
     output.dedup_by(|left, right| left.from == right.from && left.to == right.to);
     output
@@ -351,6 +514,25 @@ fn is_review_boundary(kind: &str) -> bool {
             | "use_declaration"
             | "lexical_declaration"
     )
+}
+fn is_block_boundary(kind: &str) -> bool {
+    matches!(
+        kind,
+        "block" | "compound_statement" | "block_statement" | "statement_block"
+    )
+}
+fn path_atom_kind(path: &str) -> Option<AtomKind> {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("migration") || lower.ends_with(".sql") {
+        return Some(AtomKind::Migration);
+    }
+    let configuration = [
+        ".toml", ".yaml", ".yml", ".json", ".xml", ".ini", ".cfg", ".conf", ".env",
+    ];
+    configuration
+        .iter()
+        .any(|extension| lower.ends_with(extension))
+        .then_some(AtomKind::Configuration)
 }
 fn symbol_name(text: &str, fallback: &str) -> Option<String> {
     text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
@@ -428,7 +610,7 @@ fn stabilize_symbol_atom_ids(atoms: &mut [ChangeAtom]) {
         ]);
     }
 }
-fn hunk_atom(file: &ChangedFile) -> ChangeAtom {
+fn hunk_atom_kind(file: &ChangedFile, kind: AtomKind) -> ChangeAtom {
     let lines: Vec<_> = file
         .content
         .lines()
@@ -437,7 +619,7 @@ fn hunk_atom(file: &ChangedFile) -> ChangeAtom {
         .collect();
     atom(
         file,
-        AtomKind::Hunk,
+        kind,
         None,
         file.changed_start,
         file.changed_end,
@@ -625,8 +807,40 @@ mod tests {
         });
         assert!(atoms.iter().any(|a| a.kind == AtomKind::Symbol));
     }
+
     #[test]
-    fn symbols_in_same_file_are_one_closed_projection() {
+    fn configuration_and_migration_files_have_explicit_atom_kinds() {
+        let configuration = extract_atoms(&ChangedFile {
+            path: "orkia.toml".into(),
+            content: "minimum_confidence_milli = 800\n".into(),
+            changed_start: 1,
+            changed_end: 1,
+            source_events: BTreeSet::new(),
+        });
+        assert_eq!(configuration[0].kind, AtomKind::Configuration);
+        let migration = extract_atoms(&ChangedFile {
+            path: "db/migrations/001_add_users.sql".into(),
+            content: "CREATE TABLE users (id INTEGER);\n".into(),
+            changed_start: 1,
+            changed_end: 1,
+            source_events: BTreeSet::new(),
+        });
+        assert_eq!(migration[0].kind, AtomKind::Migration);
+    }
+
+    #[test]
+    fn nested_code_blocks_are_retained_as_block_atoms() {
+        let atoms = extract_atoms(&ChangedFile {
+            path: "script.js".into(),
+            content: "if (true) { console.log(\"x\"); }\n".into(),
+            changed_start: 1,
+            changed_end: 1,
+            source_events: BTreeSet::new(),
+        });
+        assert!(atoms.iter().any(|atom| atom.kind == AtomKind::Block));
+    }
+    #[test]
+    fn disjoint_symbols_in_same_file_can_be_parallel_projections() {
         let atoms = extract_atoms(&ChangedFile {
             path: "lib.rs".into(),
             content: "fn one() {}\nfn two() {}\n".into(),
@@ -634,7 +848,96 @@ mod tests {
             changed_end: 2,
             source_events: BTreeSet::new(),
         });
-        assert!(!infer_dependencies(&atoms).is_empty());
+        assert!(infer_dependencies(&atoms).is_empty());
+    }
+
+    #[test]
+    fn concrete_diff_ranges_exclude_an_unchanged_symbol_between_hunks() {
+        let old = "fn one() {}\nfn untouched() {}\nfn three() {}\n";
+        let new = "fn one() { 1 }\nfn untouched() {}\nfn three() { 3 }\n";
+        let ranges = changed_line_ranges(old, new);
+        let atoms = extract_atoms_in_ranges(
+            &ChangedFile {
+                path: "lib.rs".into(),
+                content: new.into(),
+                changed_start: 1,
+                changed_end: 3,
+                source_events: BTreeSet::new(),
+            },
+            &ranges,
+        );
+        let symbols = atoms
+            .iter()
+            .filter_map(|atom| atom.symbol.as_deref())
+            .collect::<BTreeSet<_>>();
+        assert!(symbols.contains("one"));
+        assert!(symbols.contains("three"));
+        assert!(!symbols.contains("untouched"));
+    }
+
+    #[test]
+    fn line_ranges_keep_insertions_and_deletions_local() {
+        assert_eq!(changed_line_ranges("a\nb\n", "a\nx\nb\n"), vec![(2, 2)]);
+        assert_eq!(changed_line_ranges("a\nx\nb\n", "a\nb\n"), vec![(2, 2)]);
+    }
+
+    #[test]
+    fn overlapping_symbols_in_same_file_remain_a_hard_dependency() {
+        let atoms = vec![
+            ChangeAtom {
+                id: AtomId::new(),
+                kind: AtomKind::Symbol,
+                path: "lib.rs".into(),
+                symbol: Some("outer".into()),
+                start_line: 1,
+                end_line: 4,
+                content_hash: "outer".into(),
+                source_events: BTreeSet::new(),
+            },
+            ChangeAtom {
+                id: AtomId::new(),
+                kind: AtomKind::Symbol,
+                path: "lib.rs".into(),
+                symbol: Some("inner".into()),
+                start_line: 2,
+                end_line: 3,
+                content_hash: "inner".into(),
+                source_events: BTreeSet::new(),
+            },
+        ];
+        assert!(
+            infer_dependencies(&atoms)
+                .iter()
+                .any(|dependency| dependency.kind == DependencyKind::Hard)
+        );
+    }
+
+    #[test]
+    fn shared_captured_action_is_a_soft_causal_dependency() {
+        let event = EventId::new();
+        let left = ChangeAtom {
+            id: AtomId::new(),
+            kind: AtomKind::Symbol,
+            path: "a.rs".into(),
+            symbol: Some("left".into()),
+            start_line: 1,
+            end_line: 1,
+            content_hash: "left".into(),
+            source_events: BTreeSet::from([event.clone()]),
+        };
+        let right = ChangeAtom {
+            id: AtomId::new(),
+            kind: AtomKind::Symbol,
+            path: "b.rs".into(),
+            symbol: Some("right".into()),
+            start_line: 1,
+            end_line: 1,
+            content_hash: "right".into(),
+            source_events: BTreeSet::from([event]),
+        };
+        assert!(infer_dependencies(&[left, right]).iter().any(|dependency| {
+            dependency.kind == DependencyKind::Causal && dependency.confidence_milli == 700
+        }));
     }
 
     #[test]

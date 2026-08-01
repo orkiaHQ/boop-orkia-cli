@@ -1,9 +1,8 @@
 //! Causal capture for human sessions and coding-agent transcripts.
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use orkia_ledger::Ledger;
 use orkia_model::{CaptureEvent, CaptureOrigin, OrkiaError, Result, SessionId};
-use orkia_ports::{Clock, GitRepository, LedgerStore};
+use orkia_ports::GitRepository;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,6 +11,26 @@ use std::sync::{Arc, Mutex};
 pub trait ProviderAdapter: Send + Sync {
     fn provider_name(&self) -> &'static str;
     fn capture(&self, transcript: &str) -> Vec<CaptureEvent>;
+}
+
+/// Capture's only persistence dependency. The composition root binds this
+/// sink to the signed Git ledger (or a contract double); capture itself never
+/// imports a ledger implementation.
+pub trait EventSink: Send + Sync {
+    fn append(&self, event: CaptureEvent) -> Result<()>;
+}
+
+/// Small composition helper for binding a concrete signed ledger without
+/// making this crate depend on that implementation.
+pub struct CallbackSink<F>(pub F);
+
+impl<F> EventSink for CallbackSink<F>
+where
+    F: Fn(CaptureEvent) -> Result<()> + Send + Sync,
+{
+    fn append(&self, event: CaptureEvent) -> Result<()> {
+        (self.0)(event)
+    }
 }
 
 pub struct CodexAdapter;
@@ -75,24 +94,18 @@ pub struct Coverage {
 }
 impl Coverage {
     pub fn milli(&self) -> u16 {
-        if self.unknown_write {
-            0
-        } else if self.modified.is_empty() {
-            1000
-        } else {
-            1000
-        }
+        if self.unknown_write { 0 } else { 1000 }
     }
 }
 
-pub struct Session<L, C> {
+pub struct Session<L> {
     pub id: SessionId,
-    ledger: Ledger<L, C>,
+    ledger: L,
     coverage: Coverage,
 }
-impl<L: LedgerStore, C: Clock> Session<L, C> {
+impl<L: EventSink> Session<L> {
     pub fn start(
-        ledger: Ledger<L, C>,
+        ledger: L,
         git: &dyn GitRepository,
         origin: CaptureOrigin,
         objective: impl Into<String>,
@@ -179,10 +192,10 @@ impl WorkspaceWatcher {
         let target = changed.clone();
         let mut watcher =
             notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-                if let Ok(event) = result {
-                    if let Ok(mut paths) = target.lock() {
-                        paths.extend(event.paths);
-                    }
+                if let Ok(event) = result
+                    && let Ok(mut paths) = target.lock()
+                {
+                    paths.extend(event.paths);
                 }
             })
             .map_err(|e| OrkiaError::External(e.to_string()))?;

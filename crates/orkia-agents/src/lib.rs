@@ -350,14 +350,14 @@ pub fn parse_hook_payload(agent: Agent, raw: &str) -> Result<HookPayload, String
 pub fn normalize_hook(agent: Agent, payload: &HookPayload) -> Vec<CaptureEvent> {
     let session = payload.session_id.clone();
     let mut events = Vec::new();
-    if payload.event == "UserPromptSubmit" {
-        if let Some(content) = payload.prompt.clone() {
-            events.push(agent_action(
-                agent,
-                session.clone(),
-                AgentActionKind::Prompt { content },
-            ));
-        }
+    if payload.event == "UserPromptSubmit"
+        && let Some(content) = payload.prompt.clone()
+    {
+        events.push(agent_action(
+            agent,
+            session.clone(),
+            AgentActionKind::Prompt { content },
+        ));
     }
     if payload.event == "PostToolUse" || payload.event == "PostToolUseFailure" {
         let patch_actions = codex_apply_patch_actions(agent, &payload.raw);
@@ -637,16 +637,16 @@ fn normalize_opencode(path: &Path, content: &str) -> Result<Vec<CaptureEvent>, S
             }
         }
         for part in &parts {
-            if part.get("type").and_then(Value::as_str) == Some("tool") {
-                if let Some(action) = opencode_tool_action(part) {
-                    events.push(agent_action(Agent::OpenCode, Some(id.clone()), action));
-                }
+            if part.get("type").and_then(Value::as_str) == Some("tool")
+                && let Some(action) = opencode_tool_action(part)
+            {
+                events.push(agent_action(Agent::OpenCode, Some(id.clone()), action));
             }
         }
-        if message.get("role").and_then(Value::as_str) == Some("assistant") {
-            if let Some(turn) = opencode_turn(&message, &parts) {
-                events.push(agent_action(Agent::OpenCode, Some(id.clone()), turn));
-            }
+        if message.get("role").and_then(Value::as_str) == Some("assistant")
+            && let Some(turn) = opencode_turn(&message, &parts)
+        {
+            events.push(agent_action(Agent::OpenCode, Some(id.clone()), turn));
         }
     }
     Ok(events)
@@ -1430,12 +1430,12 @@ fn is_orkias(entry: &Value) -> bool {
     })
 }
 fn prune(settings: &mut Value) {
-    if let Some(map) = settings.as_object_mut() {
-        if let Some(hooks) = map.get_mut("hooks").and_then(Value::as_object_mut) {
-            hooks.retain(|_, entries| !entries.as_array().is_some_and(Vec::is_empty));
-            if hooks.is_empty() {
-                map.remove("hooks");
-            }
+    if let Some(map) = settings.as_object_mut()
+        && let Some(hooks) = map.get_mut("hooks").and_then(Value::as_object_mut)
+    {
+        hooks.retain(|_, entries| !entries.as_array().is_some_and(Vec::is_empty));
+        if hooks.is_empty() {
+            map.remove("hooks");
         }
     }
 }

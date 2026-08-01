@@ -3,6 +3,7 @@ name = "orkia-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "orkia-server"
@@ -11,10 +12,16 @@ path = "src/main.rs"
 [dependencies]
 axum = "0.8"
 hex.workspace = true
+git2.workspace = true
+orkia-changesets = { path = "../orkia-changesets" }
 orkia-github = { path = "../orkia-github" }
 orkia-git = { path = "../orkia-git" }
+orkia-identity = { path = "../orkia-identity" }
+orkia-index-postgres = { path = "../orkia-index-postgres" }
+orkia-ledger = { path = "../orkia-ledger" }
 orkia-model = { path = "../orkia-model" }
 orkia-policy = { path = "../orkia-policy" }
+orkia-ports = { path = "../orkia-ports" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -22,3 +29,6 @@ uuid.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.15"
