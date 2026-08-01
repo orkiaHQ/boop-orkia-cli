@@ -35,6 +35,15 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Initialize Orkia metadata for an existing Git repository.
+    Init {
+        /// Display name used only when creating a new local identity.
+        #[arg(long)]
+        name: Option<String>,
+        /// Install measured provider hooks as part of repository bootstrap.
+        #[arg(long = "agent")]
+        agent: Vec<String>,
+    },
     Identity {
         #[command(subcommand)]
         command: IdentityCommand,
@@ -393,6 +402,37 @@ fn run(cli: Cli) -> Result<()> {
     fs::create_dir_all(root.join("orkia/plans"))
         .map_err(|e| OrkiaError::External(e.to_string()))?;
     match cli.command {
+        Command::Init { name, agent } => {
+            let (actor, repository_id, identity_created) =
+                ensure_repository_initialized(&root, &secrets, name.as_deref())?;
+            let executable = std::env::current_exe()
+                .map_err(|error| OrkiaError::External(format!("current executable: {error}")))?;
+            let mut installed = Vec::new();
+            for name in agent {
+                let provider = supported_agent(&name)?;
+                let change = install_agent(provider, &executable).map_err(OrkiaError::External)?;
+                installed.push(format!(
+                    "{} ({} hook event(s))",
+                    provider.name(),
+                    change.added.len()
+                ));
+            }
+            println!(
+                "orkia initialized repository={} actor={} identity={} agents={}",
+                repository_id.0,
+                actor.id.0,
+                if identity_created {
+                    "created"
+                } else {
+                    "existing"
+                },
+                if installed.is_empty() {
+                    "none".to_owned()
+                } else {
+                    installed.join(",")
+                }
+            );
+        }
         Command::Identity {
             command: IdentityCommand::Init { name },
         } => {
@@ -2654,6 +2694,55 @@ fn load_identity(root: &Path, secrets: &FileSecrets) -> Result<Identity> {
     let actor: Actor = read_json(&root.join("orkia/actor.json"))?;
     Identity::load(secrets, "identity", actor)?
         .ok_or_else(|| OrkiaError::NotFound("run `orkia identity init` first".into()))
+}
+
+/// Initializes repository-local Orkia metadata without replacing an existing
+/// identity or repository ID. Hook installation remains an explicit option on
+/// the CLI command because provider settings are commonly user-global.
+fn ensure_repository_initialized(
+    root: &Path,
+    secrets: &FileSecrets,
+    requested_name: Option<&str>,
+) -> Result<(Actor, RepositoryId, bool)> {
+    let actor_path = root.join("orkia/actor.json");
+    let key_path = secrets.root.join("identity");
+    let (actor, identity_created) = if actor_path.exists() || key_path.exists() {
+        let actor: Actor = read_json(&actor_path)?;
+        if let Some(requested_name) = requested_name
+            && requested_name != actor.display_name
+        {
+            return Err(OrkiaError::Invalid(format!(
+                "repository already has actor `{}`; refusing to replace it with `{requested_name}`",
+                actor.display_name
+            )));
+        }
+        let _ = Identity::load(secrets, "identity", actor.clone())?
+            .ok_or_else(|| OrkiaError::NotFound("repository identity key is missing".into()))?;
+        (actor, false)
+    } else {
+        let name = requested_name.ok_or_else(|| {
+            OrkiaError::Invalid(
+                "new repository initialization requires --name for the local identity".into(),
+            )
+        })?;
+        let identity = Identity::generate(name);
+        let actor = identity.actor().clone();
+        identity.save(secrets, "identity")?;
+        write_json(&actor_path, &actor)?;
+        (actor, true)
+    };
+
+    let repository_path = root.join("orkia/repository.json");
+    let repository_id = if repository_path.exists() {
+        read_json(&repository_path)?
+    } else {
+        let repository_id = RepositoryId::new();
+        write_json(&repository_path, &repository_id)?;
+        repository_id
+    };
+    fs::create_dir_all(root.join("orkia/plans"))
+        .map_err(|error| OrkiaError::External(error.to_string()))?;
+    Ok((actor, repository_id, identity_created))
 }
 fn read_state(root: &Path) -> Result<SessionState> {
     read_json(&root.join("orkia/session.json"))
