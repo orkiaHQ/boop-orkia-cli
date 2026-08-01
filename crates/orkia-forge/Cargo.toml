@@ -1,0 +1,11 @@
+[package]
+name = "orkia-forge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orkia-model = { path = "../orkia-model" }
+
+[lints]
+workspace = true

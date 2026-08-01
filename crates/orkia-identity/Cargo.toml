@@ -1,0 +1,15 @@
+[package]
+name = "orkia-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
+orkia-model = { path = "../orkia-model" }
+orkia-ports = { path = "../orkia-ports" }
+rand_core.workspace = true
+
+[lints]
+workspace = true

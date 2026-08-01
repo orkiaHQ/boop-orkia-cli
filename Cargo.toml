@@ -1,0 +1,51 @@
+[workspace]
+members = [
+  "crates/orkia-model",
+  "crates/orkia-ports",
+  "crates/orkia-identity",
+  "crates/orkia-ledger",
+  "crates/orkia-git",
+  "crates/orkia-semantic",
+  "crates/orkia-capture",
+  "crates/orkia-review",
+  "crates/orkia-policy",
+  "crates/orkia-forge",
+  "crates/orkia-github",
+  "crates/orkia-index-postgres",
+  "crates/orkia-server",
+  "crates/orkia-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+authors = ["Orkia contributors"]
+
+[workspace.dependencies]
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
+git2 = "0.20"
+hex = "0.4"
+hmac = "0.12"
+notify = "8.0"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "signal"] }
+uuid = { version = "1.15", features = ["v4", "serde"] }
+url = { version = "2.5", features = ["serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

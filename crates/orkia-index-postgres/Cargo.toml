@@ -1,0 +1,15 @@
+[package]
+name = "orkia-index-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orkia-model = { path = "../orkia-model" }
+orkia-ports = { path = "../orkia-ports" }
+postgres = "0.19"
+serde_json.workspace = true
+time.workspace = true
+
+[lints]
+workspace = true

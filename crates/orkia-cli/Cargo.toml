@@ -1,0 +1,26 @@
+[package]
+name = "orkia-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "orkia"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+git2.workspace = true
+orkia-capture = { path = "../orkia-capture" }
+orkia-git = { path = "../orkia-git" }
+orkia-identity = { path = "../orkia-identity" }
+orkia-ledger = { path = "../orkia-ledger" }
+orkia-model = { path = "../orkia-model" }
+orkia-ports = { path = "../orkia-ports" }
+orkia-review = { path = "../orkia-review" }
+orkia-semantic = { path = "../orkia-semantic" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

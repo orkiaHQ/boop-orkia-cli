@@ -1,0 +1,17 @@
+[package]
+name = "orkia-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+git2.workspace = true
+orkia-model = { path = "../orkia-model" }
+orkia-ports = { path = "../orkia-ports" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3.15"
+
+[lints]
+workspace = true

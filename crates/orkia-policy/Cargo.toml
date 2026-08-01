@@ -1,0 +1,13 @@
+[package]
+name = "orkia-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+orkia-model = { path = "../orkia-model" }
+orkia-ports = { path = "../orkia-ports" }
+serde.workspace = true
+
+[lints]
+workspace = true

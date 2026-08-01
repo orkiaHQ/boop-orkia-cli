@@ -1,0 +1,15 @@
+[package]
+name = "orkia-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+notify.workspace = true
+orkia-ledger = { path = "../orkia-ledger" }
+orkia-model = { path = "../orkia-model" }
+orkia-ports = { path = "../orkia-ports" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "orkia-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hex.workspace = true
+orkia-identity = { path = "../orkia-identity" }
+orkia-model = { path = "../orkia-model" }
+orkia-ports = { path = "../orkia-ports" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+
+[lints]
+workspace = true
