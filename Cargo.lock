@@ -1172,6 +1172,7 @@ dependencies = [
  "orkia-semantic",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
