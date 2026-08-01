@@ -70,6 +70,7 @@ mod tests {
             source_checkpoint: "x".into(),
             units: vec![],
             atom_paths: Default::default(),
+            atoms: vec![],
             coverage_milli: 1000,
             status: orkia_model::PlanStatus::Proposed,
             created_from: Default::default(),

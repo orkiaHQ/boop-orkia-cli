@@ -13,6 +13,9 @@ on those contracts; only the CLI and server assemble concrete implementations.
 The canonical ledger is stored in `refs/orkia/ledger`. All indexes are
 rebuildable projections.
 
+The audited Atomic capability inventory and the evidence-backed Orkia roadmap
+are in [docs/atomic-capability-roadmap.md](docs/atomic-capability-roadmap.md).
+
 ## Local flow
 
 ```sh
