@@ -11,8 +11,12 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 pub fn canonical_json<T: serde::Serialize>(value: &T) -> Result<CanonicalJson> {
+    orkia_model::canonical_json(value)
+}
+
+fn legacy_json<T: serde::Serialize>(value: &T) -> Result<CanonicalJson> {
     serde_json::to_vec(value)
-        .map_err(|e| OrkiaError::Invalid(format!("cannot serialize canonical JSON: {e}")))
+        .map_err(|error| OrkiaError::Invalid(format!("cannot serialize legacy JSON: {error}")))
 }
 
 pub fn hash(bytes: &[u8]) -> Hash {
@@ -72,7 +76,18 @@ pub fn verify_chain(
                 "ledger chain is discontinuous".into(),
             ));
         }
-        let bytes = canonical_json(&event.unsigned)?;
+        let canonical = canonical_json(&event.unsigned)?;
+        let bytes = if hash(&canonical) == event.hash {
+            canonical
+        } else {
+            let legacy = legacy_json(&event.unsigned)?;
+            if hash(&legacy) != event.hash {
+                return Err(OrkiaError::Integrity(
+                    "event hash does not match payload".into(),
+                ));
+            }
+            legacy
+        };
         if hash(&bytes) != event.hash {
             return Err(OrkiaError::Integrity(
                 "event hash does not match payload".into(),
@@ -146,5 +161,29 @@ mod tests {
         let mut actors = BTreeMap::new();
         actors.insert(actor.id.clone(), actor);
         assert!(verify_chain(&store.read_all().unwrap(), &actors).is_ok());
+    }
+
+    #[test]
+    fn legacy_json_events_remain_verifiable_after_canonicalization() {
+        let identity = Identity::generate("Ada");
+        let actor = identity.actor().clone();
+        let unsigned = UnsignedEvent {
+            id: EventId::new(),
+            repository: RepositoryId::new(),
+            actor: actor.id.clone(),
+            occurred_at: time::OffsetDateTime::UNIX_EPOCH,
+            previous_hash: None,
+            event: CaptureEvent::SessionClosed {
+                session: orkia_model::SessionId::new(),
+            },
+        };
+        let bytes = legacy_json(&unsigned).unwrap();
+        let event = LedgerEvent {
+            hash: hash(&bytes),
+            signature: identity.sign(&bytes),
+            unsigned,
+        };
+        let actors = BTreeMap::from([(actor.id.clone(), actor)]);
+        assert!(verify_chain(&[event], &actors).is_ok());
     }
 }

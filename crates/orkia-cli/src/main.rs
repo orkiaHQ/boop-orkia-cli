@@ -13,8 +13,11 @@ use orkia_identity::Identity;
 use orkia_ledger::{Ledger, SystemClock, verify_chain};
 use orkia_model::{
     Actor, CaptureEvent, CaptureOrigin, OrkiaError, RepositoryId, Result, ReviewPlan, SessionId,
+    ViewMetadata, ViewScope,
 };
-use orkia_ports::{Forge, GitRepository, LedgerStore, SecretStore};
+use orkia_ports::{
+    Forge, GitRepository, LedgerStore, ReviewIndex, SecretStore, SemanticDocumentStore,
+};
 use orkia_review::{PlanningInput, plan};
 use orkia_semantic::{ChangedFile, extract_atoms, infer_dependencies};
 use serde::{Deserialize, Serialize};
@@ -48,6 +51,49 @@ enum Command {
     Ledger {
         #[command(subcommand)]
         command: LedgerCommand,
+    },
+    /// Materialize Git-backed Trunk/Branch/Leaf semantic manifests.
+    Semantic {
+        #[command(subcommand)]
+        command: SemanticCommand,
+    },
+    /// Store and retrieve encrypted secrets in Git-backed Orkia vault objects.
+    Vault {
+        #[command(subcommand)]
+        command: VaultCommand,
+    },
+    /// Seal a verified Git commit as a reproducible OCI image layout.
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
+    /// Manage signed Git-backed organization authorities.
+    Organization {
+        #[command(subcommand)]
+        command: OrganizationCommand,
+    },
+    /// Manage signed Git-backed team membership snapshots.
+    Team {
+        #[command(subcommand)]
+        command: TeamCommand,
+    },
+    /// Issue immutable signed access grants to actors and/or teams.
+    Access {
+        #[command(subcommand)]
+        command: AccessCommand,
+    },
+    Intent {
+        #[command(subcommand)]
+        command: IntentCommand,
+    },
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+    /// Manage Git-backed semantic views and their isolated worktrees.
+    View {
+        #[command(subcommand)]
+        command: ViewCommand,
     },
     Review {
         #[command(subcommand)]
@@ -95,6 +141,8 @@ enum IdentityCommand {
         #[arg(long)]
         name: String,
     },
+    /// Rotate the local key after publishing a dual-signed continuity proof.
+    Rotate,
 }
 #[derive(Subcommand)]
 enum SessionCommand {
@@ -121,6 +169,11 @@ enum SessionCommand {
         command: Vec<String>,
     },
     Checkpoint,
+    /// Sign a portable Git attestation for the current session.
+    Attest {
+        #[arg(long)]
+        commit: Option<String>,
+    },
     Close,
 }
 #[derive(Subcommand)]
@@ -128,7 +181,325 @@ enum LedgerCommand {
     Verify,
 }
 #[derive(Subcommand)]
+enum SemanticCommand {
+    /// Extract, sign and activate the semantic state of a commit.
+    Record {
+        #[arg(long)]
+        commit: Option<String>,
+    },
+    /// Verify every fetched semantic state and its signed closure.
+    Verify,
+    /// Create a verified Git three-way merge and a signed semantic resolution.
+    Merge {
+        #[arg(long)]
+        left: String,
+        #[arg(long)]
+        right: String,
+        #[arg(long)]
+        branch: String,
+    },
+    /// Record a manually resolved two-parent Git merge as a signed successor.
+    Resolve {
+        #[arg(long)]
+        resolution: String,
+        #[arg(long)]
+        commit: String,
+    },
+    /// Import a Git history into verified semantic manifests.
+    Import {
+        #[arg(long)]
+        commit: Option<String>,
+    },
+    /// Push all semantic refs through an ordinary configured Git remote.
+    Export {
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+    /// Fetch semantic refs and fail if their signed states do not verify.
+    Fetch {
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+    /// Fail-closed integrity check; optionally rebuild the non-authoritative Postgres index.
+    Doctor {
+        /// Rebuild the ledger projection using ORKIA_POSTGRES_URL after verification.
+        #[arg(long)]
+        rebuild_index: bool,
+    },
+    /// Query canonical semantic Trunks from a commit manifest.
+    Query {
+        #[arg(long)]
+        commit: Option<String>,
+        #[arg(long)]
+        path_prefix: Option<String>,
+    },
+    /// Compare two verified semantic states by paths, Trunks and operations.
+    Diff {
+        #[arg(long)]
+        base: String,
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// Show signed Trunk and operation provenance for one captured path.
+    Blame {
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        commit: Option<String>,
+    },
+    /// Walk Git history and mark only commits with verified semantic capture.
+    Log {
+        #[arg(long)]
+        commit: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+}
+#[derive(Subcommand)]
+enum VaultCommand {
+    /// Encrypt bytes from a file and publish the signed ciphertext under a name.
+    Put {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        value_file: PathBuf,
+        #[arg(long)]
+        password_file: PathBuf,
+    },
+    /// Decrypt a named entry into a new private file without printing it.
+    Get {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        password_file: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum SandboxCommand {
+    /// Create a new OCI image-layout directory from a verified commit tree.
+    Seal {
+        #[arg(long)]
+        commit: Option<String>,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Verify OCI descriptor digests and Orkia provenance annotations offline.
+    Verify {
+        #[arg(long)]
+        input: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+enum OrganizationCommand {
+    Create {
+        #[arg(long)]
+        slug: String,
+    },
+}
+#[derive(Subcommand)]
+enum TeamCommand {
+    Create {
+        /// Hash of the signed Organization object.
+        #[arg(long)]
+        organization: String,
+        #[arg(long)]
+        name: String,
+        /// UUID of a member. May be supplied more than once.
+        #[arg(long = "member", required = true)]
+        members: Vec<String>,
+    },
+}
+#[derive(Subcommand)]
+enum AccessCommand {
+    Grant {
+        #[arg(long, value_enum)]
+        role: GrantRoleArg,
+        /// Optional UUID of an individual subject.
+        #[arg(long)]
+        actor: Option<String>,
+        /// Hash of a Team object. May be supplied more than once.
+        #[arg(long = "team")]
+        teams: Vec<String>,
+        /// RepositoryId scope; omit for all repositories.
+        #[arg(long = "scope")]
+        repositories: Vec<String>,
+        /// RFC 3339 expiration instant; omit for a non-expiring grant.
+        #[arg(long)]
+        expires_at: Option<String>,
+    },
+    Revoke {
+        #[arg(long)]
+        grant: String,
+        #[arg(long)]
+        reason: String,
+    },
+}
+#[derive(Subcommand)]
+enum IntentCommand {
+    Put {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        body_file: PathBuf,
+    },
+    Show {
+        #[arg(long)]
+        hash: String,
+    },
+}
+#[derive(Subcommand)]
+enum MemoryCommand {
+    Put {
+        #[arg(long)]
+        topic: String,
+        #[arg(long)]
+        content_file: PathBuf,
+    },
+    Show {
+        #[arg(long)]
+        hash: String,
+    },
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum GrantRoleArg {
+    Administrator,
+    SharedViewMaintainer,
+    Reviewer,
+}
+
+impl From<GrantRoleArg> for orkia_model::GrantRole {
+    fn from(value: GrantRoleArg) -> Self {
+        match value {
+            GrantRoleArg::Administrator => Self::Administrator,
+            GrantRoleArg::SharedViewMaintainer => Self::SharedViewMaintainer,
+            GrantRoleArg::Reviewer => Self::Reviewer,
+        }
+    }
+}
+#[derive(Subcommand)]
+enum ViewCommand {
+    /// Create a Git branch and bind immutable semantic view metadata to it.
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        base: Option<String>,
+        /// Name of the view whose current metadata revision becomes the parent.
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        shared: bool,
+        /// Optionally check the new view out into this independent worktree.
+        #[arg(long)]
+        worktree: Option<PathBuf>,
+    },
+    Show {
+        #[arg(long)]
+        name: String,
+    },
+    /// Show Git and semantic readiness for a view.
+    Status {
+        #[arg(long)]
+        name: String,
+    },
+    /// Safely check a view branch out in the primary repository worktree.
+    Switch {
+        #[arg(long)]
+        name: String,
+    },
+    /// Advance a view to a verified descendant semantic state.
+    Update {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        commit: Option<String>,
+    },
+    /// Publish a verified commit to a Shared view using a signed maintainer grant.
+    Publish {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        commit: Option<String>,
+        /// Hash of a signed AccessGrant. May be supplied more than once.
+        #[arg(long = "grant", required = true)]
+        grants: Vec<String>,
+    },
+    /// Remove a Draft view's refs while retaining its Git commits and blobs.
+    Delete {
+        #[arg(long)]
+        name: String,
+        /// Required to remove a Shared view.
+        #[arg(long)]
+        force_shared: bool,
+    },
+    /// Restrict a view to root operations of its verified active state.
+    Filter {
+        #[arg(long)]
+        name: String,
+        #[arg(long = "operation", required = true)]
+        operations: Vec<String>,
+    },
+    /// Save current uncommitted work using Git's stash namespace.
+    Stash {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "orkia view stash")]
+        message: String,
+        #[arg(long)]
+        include_untracked: bool,
+    },
+    /// Create an annotated Git tag at a view's current tip.
+    Tag {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        tag: String,
+        #[arg(long, default_value = "Orkia view tag")]
+        message: String,
+    },
+    /// Commit current work, materialize its semantic state and advance the view.
+    Record {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        message: String,
+    },
+    /// Replace the current single-parent view tip from the working tree.
+    Revise {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        message: String,
+    },
+    /// Restore tracked files and index to the checked-out view tip.
+    Restore {
+        #[arg(long)]
+        name: String,
+    },
+    /// Safely rewind a clean checked-out view by one verified commit.
+    Unrecord {
+        #[arg(long)]
+        name: String,
+    },
+    /// Check an existing view out in a new isolated Git worktree.
+    Worktree {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        path: PathBuf,
+    },
+}
+#[derive(Subcommand)]
 enum ReviewCommand {
+    /// Sign and migrate a legacy local review-plan JSON into Git refs.
+    Import {
+        #[arg(long)]
+        path: PathBuf,
+    },
     Plan {
         #[arg(long)]
         checkpoint: Option<String>,
@@ -240,6 +611,26 @@ fn run(cli: Cli) -> Result<()> {
             write_json(&root.join("orkia/repository.json"), &RepositoryId::new())?;
             println!("identity {} initialized", identity.actor().id.0);
         }
+        Command::Identity {
+            command: IdentityCommand::Rotate,
+        } => {
+            let current = load_identity(&root, &secrets)?;
+            let next = current.successor();
+            let rotation = git
+                .semantic_store()
+                .put_key_rotation(&orkia_model::KeyRotation {
+                    schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
+                    actor: current.actor().id.clone(),
+                    previous_public_key: current.actor().public_key.clone(),
+                    next_public_key: next.actor().public_key.clone(),
+                })?;
+            git.semantic_store().sign_document(&rotation, &current)?;
+            git.semantic_store().sign_document(&rotation, &next)?;
+            git.semantic_store().verify_key_rotation(&rotation)?;
+            next.save(&secrets, "identity")?;
+            write_json(&root.join("orkia/actor.json"), next.actor())?;
+            println!("identity key rotated as {}", rotation.hash);
+        }
         Command::Session { command } => {
             handle_session(command, &git, &root, &secrets, &cli.repository)?
         }
@@ -253,6 +644,634 @@ fn run(cli: Cli) -> Result<()> {
             verify_chain(&events, &actors)?;
             println!("verified {} signed ledger events", events.len());
         }
+        Command::Semantic { command } => match command {
+            SemanticCommand::Record { commit } => {
+                let commit = commit.unwrap_or(git.head_commit()?);
+                let actor: Actor = read_json(&root.join("orkia/actor.json"))?;
+                let identity = Identity::load(&secrets, "identity", actor)?
+                    .ok_or_else(|| OrkiaError::NotFound("Orkia identity".into()))?;
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let state = git.materialize_semantic_state(&commit, &identity, &policy)?;
+                println!("semantic state {} activated for {commit}", state.hash);
+            }
+            SemanticCommand::Verify => {
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let report = git.verify_orkia_refs(&policy)?;
+                println!("verified {} semantic state ref(s)", report.verified_states);
+            }
+            SemanticCommand::Merge {
+                left,
+                right,
+                branch,
+            } => {
+                let actor: Actor = read_json(&root.join("orkia/actor.json"))?;
+                let identity = Identity::load(&secrets, "identity", actor)?
+                    .ok_or_else(|| OrkiaError::NotFound("Orkia identity".into()))?;
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let result = git.semantic_merge(&left, &right, &branch, &identity, &policy)?;
+                println!(
+                    "semantic merge {:?}; resolution={}; result={}",
+                    result.outcome,
+                    result.resolution.hash,
+                    result.result_commit.unwrap_or_else(|| "conflict".into())
+                );
+            }
+            SemanticCommand::Resolve { resolution, commit } => {
+                let identity = load_identity(&root, &secrets)?;
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let resolution = git.finalize_merge_resolution(
+                    &orkia_model::SemanticObjectRef {
+                        kind: orkia_model::SemanticObjectKind::Resolution,
+                        hash: resolution,
+                    },
+                    &commit,
+                    &identity,
+                    &policy,
+                )?;
+                println!(
+                    "semantic conflict finalized for {commit} as {}",
+                    resolution.hash
+                );
+            }
+            SemanticCommand::Import { commit } => {
+                let commit = commit.unwrap_or(git.head_commit()?);
+                let actor: Actor = read_json(&root.join("orkia/actor.json"))?;
+                let identity = Identity::load(&secrets, "identity", actor)?
+                    .ok_or_else(|| OrkiaError::NotFound("Orkia identity".into()))?;
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let states = git.import_semantic_history(&commit, &identity, &policy)?;
+                println!("imported or verified {} semantic state(s)", states.len());
+            }
+            SemanticCommand::Export { remote } => {
+                git.push_orkia_refs(&remote)?;
+                println!("exported Orkia refs to {remote} through Git");
+            }
+            SemanticCommand::Fetch { remote } => {
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let report = git.fetch_verified_orkia_refs(&remote, &policy)?;
+                println!(
+                    "fetched and verified {} semantic state ref(s) from {remote}",
+                    report.verified_states
+                );
+            }
+            SemanticCommand::Doctor { rebuild_index } => {
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let report = git.verify_orkia_refs(&policy)?;
+                if rebuild_index {
+                    let url = std::env::var("ORKIA_POSTGRES_URL").map_err(|_| {
+                        OrkiaError::NotFound(
+                            "ORKIA_POSTGRES_URL required for --rebuild-index".into(),
+                        )
+                    })?;
+                    let index = orkia_index_postgres::PostgresIndex::connect(&url)?;
+                    let events = git.ledger_store().read_all()?;
+                    index.rebuild(&events)?;
+                    println!(
+                        "reconstructed Postgres ledger index from {} Git event(s)",
+                        events.len()
+                    );
+                }
+                println!(
+                    "doctor passed: {} semantic state ref(s) are rebuildable from Git",
+                    report.verified_states
+                );
+            }
+            SemanticCommand::Query {
+                commit,
+                path_prefix,
+            } => {
+                let commit = commit.unwrap_or(git.head_commit()?);
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                for trunk in git.query_trunks(&commit, path_prefix.as_deref(), &policy)? {
+                    println!(
+                        "{}\t{:?}\t{}",
+                        trunk.id.0,
+                        trunk.state,
+                        trunk.paths.iter().cloned().collect::<Vec<_>>().join(",")
+                    );
+                }
+            }
+            SemanticCommand::Diff { base, target } => {
+                let target = target.unwrap_or(git.head_commit()?);
+                let policy = repository_policy(&cli.repository)?;
+                let diff = git.semantic_diff(&base, &target, &policy)?;
+                println!("base={}\ttarget={}", diff.base_commit, diff.target_commit);
+                for path in diff.changed_paths {
+                    println!("path\t{path}");
+                }
+                for trunk in diff.added_trunks {
+                    println!("trunk-added\t{}", trunk.0);
+                }
+                for trunk in diff.removed_trunks {
+                    println!("trunk-removed\t{}", trunk.0);
+                }
+                for trunk in diff.changed_trunks {
+                    println!("trunk-changed\t{}", trunk.0);
+                }
+                for operation in diff.added_operations {
+                    println!("operation-added\t{}", operation.hash);
+                }
+                for operation in diff.removed_operations {
+                    println!("operation-removed\t{}", operation.hash);
+                }
+            }
+            SemanticCommand::Blame { path, commit } => {
+                let commit = commit.unwrap_or(git.head_commit()?);
+                let policy = repository_policy(&cli.repository)?;
+                let blame = git.semantic_blame(&commit, &path, &policy)?;
+                println!("commit={}\tpath={}", blame.commit, blame.path);
+                for trunk in blame.trunks {
+                    println!("trunk\t{}\t{:?}", trunk.id.0, trunk.state);
+                }
+                for operation in blame.operations {
+                    println!("operation\t{}", operation.hash);
+                }
+            }
+            SemanticCommand::Log { commit, limit } => {
+                let commit = commit.unwrap_or(git.head_commit()?);
+                let policy = repository_policy(&cli.repository)?;
+                for entry in git.semantic_log(&commit, limit, &policy)? {
+                    println!(
+                        "{}\t{}",
+                        entry.commit,
+                        entry
+                            .state
+                            .map(|state| format!("verified:{}", state.hash))
+                            .unwrap_or_else(|| "git-fallback".into())
+                    );
+                }
+            }
+        },
+        Command::Vault { command } => match command {
+            VaultCommand::Put {
+                name,
+                value_file,
+                password_file,
+            } => {
+                let value = fs::read(&value_file).map_err(|error| {
+                    OrkiaError::External(format!("cannot read vault value: {error}"))
+                })?;
+                let password = fs::read(&password_file).map_err(|error| {
+                    OrkiaError::External(format!("cannot read vault password: {error}"))
+                })?;
+                let identity = load_identity(&root, &secrets)?;
+                let entry = git
+                    .semantic_store()
+                    .store_vault_secret(&name, &value, &password, &identity)?;
+                println!("encrypted vault entry {name} stored as {}", entry.hash);
+            }
+            VaultCommand::Get {
+                name,
+                password_file,
+                output,
+            } => {
+                if output.exists() {
+                    return Err(OrkiaError::Conflict(format!(
+                        "refusing to overwrite existing vault output {}",
+                        output.display()
+                    )));
+                }
+                let password = fs::read(&password_file).map_err(|error| {
+                    OrkiaError::External(format!("cannot read vault password: {error}"))
+                })?;
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let value = git
+                    .semantic_store()
+                    .read_vault_secret(&name, &password, &policy)?;
+                write_private_file(&output, &value)?;
+                println!("vault entry {name} decrypted to {}", output.display());
+            }
+        },
+        Command::Sandbox { command } => match command {
+            SandboxCommand::Seal { commit, output } => {
+                let commit = commit.unwrap_or(git.head_commit()?);
+                let policy = repository_policy(&cli.repository)?;
+                let seal = git.seal_sandbox(&commit, &output, &policy)?;
+                println!(
+                    "sealed {} as OCI layout {} (manifest sha256:{})",
+                    seal.commit,
+                    output.display(),
+                    seal.manifest_digest
+                );
+            }
+            SandboxCommand::Verify { input } => {
+                let seal = LibGit2Repository::verify_sandbox(&input)?;
+                println!(
+                    "verified OCI layout: commit={} state={} manifest=sha256:{}",
+                    seal.commit, seal.state.hash, seal.manifest_digest
+                );
+            }
+        },
+        Command::Organization { command } => match command {
+            OrganizationCommand::Create { slug } => {
+                let identity = load_identity(&root, &secrets)?;
+                let store = git.semantic_store();
+                let organization = store.put_organization(&orkia_model::Organization {
+                    schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
+                    slug: slug.clone(),
+                    issuer: identity.actor().id.clone(),
+                })?;
+                store.sign_document(&organization, &identity)?;
+                println!("organization {slug} created as {}", organization.hash);
+            }
+        },
+        Command::Team { command } => match command {
+            TeamCommand::Create {
+                organization,
+                name,
+                members,
+            } => {
+                let identity = load_identity(&root, &secrets)?;
+                let store = git.semantic_store();
+                let organization = orkia_model::SemanticObjectRef {
+                    kind: orkia_model::SemanticObjectKind::Organization,
+                    hash: organization,
+                };
+                let policy = repository_policy(&cli.repository)?;
+                let authority = store.verify_organization(&organization, &policy)?;
+                if authority.issuer != identity.actor().id {
+                    return Err(OrkiaError::Policy(
+                        "only the organization issuer may publish a team snapshot".into(),
+                    ));
+                }
+                let members = members
+                    .into_iter()
+                    .map(|member| {
+                        member
+                            .parse::<uuid::Uuid>()
+                            .map(orkia_model::ActorId)
+                            .map_err(|error| {
+                                OrkiaError::Invalid(format!("invalid team member UUID: {error}"))
+                            })
+                    })
+                    .collect::<Result<BTreeSet<_>>>()?;
+                let team = store.put_team(&orkia_model::Team {
+                    schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
+                    organization,
+                    name: name.clone(),
+                    issuer: identity.actor().id.clone(),
+                    members,
+                })?;
+                store.sign_document(&team, &identity)?;
+                println!("team {name} created as {}", team.hash);
+            }
+        },
+        Command::Access { command } => match command {
+            AccessCommand::Grant {
+                role,
+                actor,
+                teams,
+                repositories,
+                expires_at,
+            } => {
+                let identity = load_identity(&root, &secrets)?;
+                let actor = actor
+                    .map(|actor| {
+                        actor
+                            .parse::<uuid::Uuid>()
+                            .map(orkia_model::ActorId)
+                            .map_err(|error| {
+                                OrkiaError::Invalid(format!("invalid grant actor UUID: {error}"))
+                            })
+                    })
+                    .transpose()?;
+                let teams = teams
+                    .into_iter()
+                    .map(|hash| orkia_model::SemanticObjectRef {
+                        kind: orkia_model::SemanticObjectKind::Team,
+                        hash,
+                    })
+                    .collect::<BTreeSet<_>>();
+                let store = git.semantic_store();
+                let policy = repository_policy(&cli.repository)?;
+                for team in &teams {
+                    store.verify_team(team, &policy)?;
+                }
+                let grant = store.put_access_grant(&orkia_model::AccessGrant {
+                    schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
+                    issuer: identity.actor().id.clone(),
+                    actor,
+                    role: role.into(),
+                    repositories: repositories.into_iter().collect(),
+                    teams,
+                    expires_at,
+                })?;
+                store.sign_document(&grant, &identity)?;
+                println!("signed access grant created as {}", grant.hash);
+            }
+            AccessCommand::Revoke { grant, reason } => {
+                let identity = load_identity(&root, &secrets)?;
+                let grant = orkia_model::SemanticObjectRef {
+                    kind: orkia_model::SemanticObjectKind::Grant,
+                    hash: grant,
+                };
+                let document = git.semantic_store().get_access_grant(&grant)?;
+                if document.issuer != identity.actor().id {
+                    return Err(OrkiaError::Policy(
+                        "only the grant issuer may revoke it".into(),
+                    ));
+                }
+                let revocation =
+                    git.semantic_store()
+                        .put_grant_revocation(&orkia_model::GrantRevocation {
+                            schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
+                            grant,
+                            issuer: identity.actor().id.clone(),
+                            reason,
+                        })?;
+                git.semantic_store().sign_document(&revocation, &identity)?;
+                println!("signed grant revocation {}", revocation.hash);
+            }
+        },
+        Command::Intent { command } => match command {
+            IntentCommand::Put { title, body_file } => {
+                let identity = load_identity(&root, &secrets)?;
+                let body = fs::read_to_string(body_file)
+                    .map_err(|e| OrkiaError::External(e.to_string()))?;
+                let object = git.semantic_store().put_intent(&orkia_model::Intent {
+                    schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
+                    title,
+                    body,
+                    session: None,
+                    evidence: BTreeSet::new(),
+                })?;
+                git.semantic_store().sign_document(&object, &identity)?;
+                println!("signed intent {}", object.hash);
+            }
+            IntentCommand::Show { hash } => {
+                let object = git
+                    .semantic_store()
+                    .get_intent(&orkia_model::SemanticObjectRef {
+                        kind: orkia_model::SemanticObjectKind::Intent,
+                        hash,
+                    })?;
+                println!("{}\n\n{}", object.title, object.body);
+            }
+        },
+        Command::Memory { command } => match command {
+            MemoryCommand::Put {
+                topic,
+                content_file,
+            } => {
+                let identity = load_identity(&root, &secrets)?;
+                let content = fs::read_to_string(content_file)
+                    .map_err(|e| OrkiaError::External(e.to_string()))?;
+                let object = git.semantic_store().put_memory(&orkia_model::Memory {
+                    schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
+                    topic,
+                    content,
+                    evidence: BTreeSet::new(),
+                })?;
+                git.semantic_store().sign_document(&object, &identity)?;
+                println!("signed memory {}", object.hash);
+            }
+            MemoryCommand::Show { hash } => {
+                let object = git
+                    .semantic_store()
+                    .get_memory(&orkia_model::SemanticObjectRef {
+                        kind: orkia_model::SemanticObjectKind::Memory,
+                        hash,
+                    })?;
+                println!("{}\n\n{}", object.topic, object.content);
+            }
+        },
+        Command::View { command } => match command {
+            ViewCommand::Create {
+                name,
+                branch,
+                base,
+                parent,
+                shared,
+                worktree,
+            } => {
+                let base_commit = base.unwrap_or(git.head_commit()?);
+                let branch = branch.unwrap_or_else(|| format!("orkia/views/{name}"));
+                let view = ViewMetadata {
+                    schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
+                    name: name.clone(),
+                    branch: branch.clone(),
+                    base_commit,
+                    scope: if shared {
+                        ViewScope::Shared
+                    } else {
+                        ViewScope::Draft
+                    },
+                    parent: None,
+                    visible_operations: BTreeSet::new(),
+                };
+                let object = if let Some(parent) = parent {
+                    git.create_child_view(&view, &parent)?
+                } else {
+                    git.create_view(&view)?
+                };
+                if let Some(path) = worktree {
+                    git.create_view_worktree(&name, &path)?;
+                    println!(
+                        "view {name} ({branch}) created as {} with worktree {}",
+                        object.hash,
+                        path.display()
+                    );
+                } else {
+                    println!("view {name} ({branch}) created as {}", object.hash);
+                }
+            }
+            ViewCommand::Show { name } => {
+                let view = git.view(&name)?;
+                println!(
+                    "{}\tbranch={}\tbase={}\tscope={:?}",
+                    view.name, view.branch, view.base_commit, view.scope
+                );
+            }
+            ViewCommand::Status { name } => {
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let status = git.view_status(&name, &policy)?;
+                println!(
+                    "{}\tbranch={}\ttip={}\tmetadata_matches_branch={}\tgit_changes={}\tsemantic_verified={}\tunpublished_operations={}\tsemantic_error={}",
+                    status.name,
+                    status.branch,
+                    status.branch_tip,
+                    status.metadata_matches_branch,
+                    status.working_tree_changes,
+                    status.semantic_verified,
+                    status.unpublished_operations,
+                    status.semantic_error.unwrap_or_else(|| "-".into()),
+                );
+            }
+            ViewCommand::Switch { name } => {
+                git.switch_view(&name)?;
+                println!("switched primary worktree to view {name}");
+            }
+            ViewCommand::Update { name, commit } => {
+                let commit = commit.unwrap_or(git.head_commit()?);
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let metadata = git.advance_view(&name, &commit, &policy)?;
+                println!("view {name} advanced to {commit} as {}", metadata.hash);
+            }
+            ViewCommand::Publish {
+                name,
+                commit,
+                grants,
+            } => {
+                let commit = commit.unwrap_or(git.head_commit()?);
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let identity = load_identity(&root, &secrets)?;
+                let grants = grants
+                    .into_iter()
+                    .map(|hash| orkia_model::SemanticObjectRef {
+                        kind: orkia_model::SemanticObjectKind::Grant,
+                        hash,
+                    })
+                    .collect();
+                let repository: RepositoryId = read_json(&root.join("orkia/repository.json"))?;
+                let metadata = git.publish_shared_view_for_repository(
+                    &name,
+                    &commit,
+                    &identity.actor().id,
+                    grants,
+                    &repository.0.to_string(),
+                    &policy,
+                )?;
+                println!(
+                    "Shared view {name} published at {commit} as {}",
+                    metadata.hash
+                );
+            }
+            ViewCommand::Delete { name, force_shared } => {
+                git.delete_view(&name, force_shared)?;
+                println!(
+                    "view {name} deleted; its Git commits and semantic blobs remain recoverable"
+                );
+            }
+            ViewCommand::Filter { name, operations } => {
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let operations = operations
+                    .into_iter()
+                    .map(|hash| orkia_model::SemanticObjectRef {
+                        kind: orkia_model::SemanticObjectKind::Operation,
+                        hash,
+                    })
+                    .collect();
+                let metadata = git.set_view_visible_operations(&name, operations, &policy)?;
+                println!("view {name} filter updated as {}", metadata.hash);
+            }
+            ViewCommand::Stash {
+                name,
+                message,
+                include_untracked,
+            } => {
+                let stash = git.stash_view(&name, &message, include_untracked)?;
+                println!("view {name} stashed as {stash}");
+            }
+            ViewCommand::Tag { name, tag, message } => {
+                let object = git.tag_view(&name, &tag, &message)?;
+                println!("view {name} tagged {tag} as {object}");
+            }
+            ViewCommand::Record { name, message } => {
+                let identity = load_identity(&root, &secrets)?;
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let state = git.record_view(&name, &message, &identity, &policy)?;
+                println!("view {name} recorded and advanced as {}", state.hash);
+            }
+            ViewCommand::Revise { name, message } => {
+                let identity = load_identity(&root, &secrets)?;
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let state = git.revise_view(&name, &message, &identity, &policy)?;
+                println!("view {name} revised and advanced as {}", state.hash);
+            }
+            ViewCommand::Restore { name } => {
+                git.restore_view(&name)?;
+                println!("view {name} restored to its Git tip");
+            }
+            ViewCommand::Unrecord { name } => {
+                let policy_path = cli.repository.join("orkia.toml");
+                let policy = if policy_path.exists() {
+                    orkia_policy::load(&policy_path)?
+                } else {
+                    orkia_model::RepositoryPolicy::default()
+                };
+                let state = git.unrecord_view(&name, &policy)?;
+                println!("view {name} unrecorded to semantic state {}", state.hash);
+            }
+            ViewCommand::Worktree { name, path } => {
+                git.create_view_worktree(&name, &path)?;
+                println!("view {name} checked out at {}", path.display());
+            }
+        },
         Command::Review { command } => {
             handle_review(command, &git, &root, &cli.repository, &secrets)?
         }
@@ -261,14 +1280,13 @@ fn run(cli: Cli) -> Result<()> {
             branch,
             approvals,
         } => {
-            let review: ReviewPlan =
-                read_json(&root.join("orkia/plans").join(format!("{plan}.json")))?;
             let policy_path = cli.repository.join("orkia.toml");
             let policy = if policy_path.exists() {
                 orkia_policy::load(&policy_path)?
             } else {
                 orkia_model::RepositoryPolicy::default()
             };
+            let review = load_review_plan(&git, &plan, &policy)?;
             let ledger = open_repository_ledger(&git, &root, &secrets)?;
             let validations = run_validations(&cli.repository, &policy, &ledger)?;
             orkia_policy::evaluate(&policy, &review, &validations, approvals, &branch)?;
@@ -470,7 +1488,7 @@ fn handle_session(
                 Provider::Claude => Box::new(ClaudeAdapter),
             };
             for event in adapter.capture(&body) {
-                ledger.append(event)?;
+                ledger.append(bind_turn_to_session(event, &state))?;
             }
             println!(
                 "captured {} transcript bytes into session {}",
@@ -510,7 +1528,7 @@ fn handle_session(
                 Provider::Claude => Box::new(ClaudeAdapter),
             };
             for event in adapter.capture(&stdout) {
-                ledger.append(event)?;
+                ledger.append(bind_turn_to_session(event, &state))?;
             }
             record_known_changes(git, root, &mut state, &ledger, &before)?;
             if !output.status.success() {
@@ -564,6 +1582,19 @@ fn handle_session(
             })?;
             println!("checkpoint captured");
         }
+        SessionCommand::Attest { commit } => {
+            let state: SessionState = read_json(&root.join("orkia/session.json"))?;
+            let identity = load_identity(root, secrets)?;
+            let result = commit.unwrap_or(git.head_commit()?);
+            let attestation = git.semantic_store().attest_session(
+                state.id,
+                state.base_commit,
+                Some(result),
+                BTreeSet::new(),
+                &identity,
+            )?;
+            println!("session attested as {}", attestation.hash);
+        }
         SessionCommand::Close => {
             let (state, ledger) = open_ledger(git, root, secrets)?;
             ledger.append(CaptureEvent::SessionClosed { session: state.id })?;
@@ -573,14 +1604,68 @@ fn handle_session(
     }
     Ok(())
 }
+
+fn bind_turn_to_session(event: CaptureEvent, state: &SessionState) -> CaptureEvent {
+    match event {
+        CaptureEvent::AgentTurn {
+            provider,
+            turn_id,
+            model,
+            input_tokens,
+            output_tokens,
+            cost_micros,
+            ..
+        } => CaptureEvent::AgentTurn {
+            provider,
+            session: Some(state.id.clone()),
+            base_commit: Some(state.base_commit.clone()),
+            turn_id,
+            model,
+            input_tokens,
+            output_tokens,
+            cost_micros,
+        },
+        CaptureEvent::AgentAction {
+            provider,
+            turn_id,
+            action_id,
+            kind,
+            paths,
+            command,
+            exit_code,
+            ..
+        } => CaptureEvent::AgentAction {
+            provider,
+            session: Some(state.id.clone()),
+            base_commit: Some(state.base_commit.clone()),
+            turn_id,
+            action_id,
+            kind,
+            paths,
+            command,
+            exit_code,
+        },
+        event => event,
+    }
+}
+
 fn handle_review(
     command: ReviewCommand,
     git: &LibGit2Repository,
     root: &Path,
-    _repository: &Path,
+    repository: &Path,
     secrets: &FileSecrets,
 ) -> Result<()> {
     match command {
+        ReviewCommand::Import { path } => {
+            let plan: ReviewPlan = read_json(&path)?;
+            let identity = load_identity(root, secrets)?;
+            let object = git.semantic_store().store_review_plan(&plan, &identity)?;
+            println!(
+                "legacy review plan {} revision {} imported as {}",
+                plan.id.0, plan.revision, object.hash
+            );
+        }
         ReviewCommand::Plan { checkpoint } => {
             let events = git.ledger_store().read_all()?;
             let base = latest_session_base(&events)?;
@@ -625,8 +1710,8 @@ fn handle_review(
                 minimum_confidence_milli: 800,
                 source_events,
             });
-            let destination = root.join("orkia/plans").join(format!("{}.json", plan.id.0));
-            write_json(&destination, &plan)?;
+            let identity = load_identity(root, secrets)?;
+            git.semantic_store().store_review_plan(&plan, &identity)?;
             println!(
                 "review plan {}: {} unit(s), coverage {}‰",
                 plan.id.0,
@@ -635,8 +1720,7 @@ fn handle_review(
             );
         }
         ReviewCommand::Show { plan } => {
-            let value: ReviewPlan =
-                read_json(&root.join("orkia/plans").join(format!("{plan}.json")))?;
+            let value = load_review_plan(git, &plan, &repository_policy(repository)?)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&value)
@@ -647,8 +1731,7 @@ fn handle_review(
             plan: plan_id,
             units,
         } => {
-            let path = root.join("orkia/plans").join(format!("{plan_id}.json"));
-            let current: ReviewPlan = read_json(&path)?;
+            let current = load_review_plan(git, &plan_id, &repository_policy(repository)?)?;
             let units = units
                 .into_iter()
                 .filter(|value| !value.trim().is_empty())
@@ -669,10 +1752,9 @@ fn handle_review(
                     reason: "reviewer merge via CLI".into(),
                 },
             )?;
-            let destination = root
-                .join("orkia/plans")
-                .join(format!("{}.json", revised.id.0));
-            write_json(&destination, &revised)?;
+            let identity = load_identity(root, secrets)?;
+            git.semantic_store()
+                .store_review_plan(&revised, &identity)?;
             open_repository_ledger(git, root, secrets)?.append(
                 CaptureEvent::ReviewPlanRevised {
                     plan: revised.id.clone(),
@@ -683,8 +1765,7 @@ fn handle_review(
             println!("review plan revision {} created", revised.id.0);
         }
         ReviewCommand::Project { plan: plan_id } => {
-            let plan: ReviewPlan =
-                read_json(&root.join("orkia/plans").join(format!("{plan_id}.json")))?;
+            let plan = load_review_plan(git, &plan_id, &repository_policy(repository)?)?;
             let base = latest_session_base(&git.ledger_store().read_all()?)?;
             let mut commits = BTreeMap::new();
             for projection in orkia_forge::projections(&plan, &base)? {
@@ -718,8 +1799,7 @@ fn handle_review(
         } => {
             let token = std::env::var("ORKIA_GITHUB_INSTALLATION_TOKEN")
                 .map_err(|_| OrkiaError::NotFound("ORKIA_GITHUB_INSTALLATION_TOKEN".into()))?;
-            let plan: ReviewPlan =
-                read_json(&root.join("orkia/plans").join(format!("{plan_id}.json")))?;
+            let plan = load_review_plan(git, &plan_id, &repository_policy(repository)?)?;
             let github = GitHubApp::new(github_owner, github_repository, token)?;
             for projection in orkia_forge::projections(&plan, &base)? {
                 git.push_branch(&remote, &projection.branch)?;
@@ -730,6 +1810,28 @@ fn handle_review(
     }
     Ok(())
 }
+
+fn repository_policy(repository: &Path) -> Result<orkia_model::RepositoryPolicy> {
+    let path = repository.join("orkia.toml");
+    if path.exists() {
+        orkia_policy::load(&path)
+    } else {
+        Ok(orkia_model::RepositoryPolicy::default())
+    }
+}
+
+fn load_review_plan(
+    git: &LibGit2Repository,
+    value: &str,
+    policy: &orkia_model::RepositoryPolicy,
+) -> Result<ReviewPlan> {
+    let id = value
+        .parse::<uuid::Uuid>()
+        .map(orkia_model::PlanId)
+        .map_err(|error| OrkiaError::Invalid(format!("invalid review plan ID: {error}")))?;
+    git.semantic_store().latest_review_plan(&id, policy)
+}
+
 fn open_ledger(
     git: &LibGit2Repository,
     root: &Path,
@@ -839,6 +1941,17 @@ fn run_validations(
     }
     Ok(results)
 }
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    fs::write(path, bytes).map_err(|error| OrkiaError::External(error.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| OrkiaError::External(error.to_string()))?;
+    }
+    Ok(())
+}
+
 fn load_identity(root: &Path, secrets: &FileSecrets) -> Result<Identity> {
     let actor: Actor = read_json(&root.join("orkia/actor.json"))?;
     Identity::load(secrets, "identity", actor)?

@@ -25,6 +25,18 @@ impl Identity {
     pub fn actor(&self) -> &Actor {
         &self.actor
     }
+    /// Generates a replacement key while preserving the durable actor ID.
+    pub fn successor(&self) -> Self {
+        let signing = SigningKey::generate(&mut OsRng);
+        Self {
+            actor: Actor {
+                id: self.actor.id.clone(),
+                display_name: self.actor.display_name.clone(),
+                public_key: STANDARD_NO_PAD.encode(signing.verifying_key().as_bytes()),
+            },
+            signing,
+        }
+    }
     pub fn sign(&self, bytes: &[u8]) -> String {
         STANDARD_NO_PAD.encode(self.signing.sign(bytes).to_bytes())
     }

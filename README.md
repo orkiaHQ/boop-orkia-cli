@@ -13,6 +13,9 @@ on those contracts; only the CLI and server assemble concrete implementations.
 The canonical ledger is stored in `refs/orkia/ledger`. All indexes are
 rebuildable projections.
 
+The Git-native Atomic capability-parity roadmap is in
+[docs/atomic-capability-roadmap.md](docs/atomic-capability-roadmap.md).
+
 ## Local flow
 
 ```sh
@@ -41,6 +44,13 @@ An optional, versioned `orkia.toml` configures `protected_branches`,
 `validation_commands`, `minimum_coverage_milli`, `minimum_confidence_milli`
 and `required_approvals`. `orkia integrate` runs those validations and records
 their signed outcomes before permitting integration.
+
+Captured commits can be inspected without a separate database: `orkia semantic
+diff --base <commit>`, `semantic blame --path <path>` and `semantic log` read
+only verified Git-backed manifests and label uncaptured history as Git
+fallback. Signed access grants may be scoped to repository IDs, teams and an
+RFC 3339 expiry; team-backed grants require a signed organization/team chain
+trusted by `authorized_grant_issuers` in the versioned policy.
 
 ## Status
 
