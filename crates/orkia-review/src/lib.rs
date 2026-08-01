@@ -82,6 +82,7 @@ pub fn plan(input: PlanningInput) -> ReviewPlan {
         .map(|atom| (atom.id.clone(), atom.path.clone()))
         .collect();
     ReviewPlan {
+        schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
         id: deterministic_plan(&input.checkpoint, 0),
         revision: 0,
         source_checkpoint: input.checkpoint,
@@ -197,6 +198,7 @@ fn one_unit_plan(input: &PlanningInput, confidence: u16) -> ReviewPlan {
         .map(|atom| (atom.id.clone(), atom.path.clone()))
         .collect();
     ReviewPlan {
+        schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
         id: deterministic_plan(&input.checkpoint, 0),
         revision: 0,
         source_checkpoint: input.checkpoint.clone(),

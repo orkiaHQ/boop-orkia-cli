@@ -65,6 +65,7 @@ mod tests {
         policy.minimum_coverage_milli = 0;
         policy.minimum_confidence_milli = 0;
         let plan = ReviewPlan {
+            schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
             id: orkia_model::PlanId::new(),
             revision: 0,
             source_checkpoint: "x".into(),

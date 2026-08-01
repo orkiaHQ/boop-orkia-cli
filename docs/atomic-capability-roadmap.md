@@ -1,156 +1,242 @@
-# Feuille de route de parité Atomic → Orkia
+# Feuille de route Orkia — sessions agent, ChangeSets et stacks Git
 
-> État de l'audit : 1 août 2026. Ce document est une trace de décision et de
-> livraison, pas une déclaration de parité. Toute ligne marquée *vérifiée* est
-> reliée à un élément de code inspecté ; toute autre ligne reste un objectif.
+> Révision produit : 1 août 2026.  
+> Inspiration de référence : Atomic, source disponible sous
+> `/Volumes/MyWorld/monkey.d.labs/coding/riftrHQ/_killix/inspiration_code/atomic`.  
+> Direction : Git reste l’autorité du contenu et du transport ; Orkia rend
+> persistantes l’intention, la causalité agent et l’orchestration des changesets.
 
-## Objet et méthode
+## Décision produit
 
-Orkia est un **moteur sémantique Git-native** : Git est la source de contenu,
-de synchronisation et de branches ; Orkia ajoute la capture causale signée,
-la politique et la projection de review. Atomic est un système de contrôle de
-version autonome, doté d'un moteur CRDT. La parité recherchée est donc une
-parité de capacité observable pour le flux capture → compréhension → review
-→ intégration, et non le remplacement du stockage Git par le CRDT d'Atomic.
+Le produit ne doit pas avoir le **diff Git** comme artefact principal. Son
+unité de travail est une **session agent** qui produit des preuves et un ou
+plusieurs **ChangeSets**. Les commits, branches, diffs et PRs sont les
+projections Git de ces ChangeSets.
 
-La source auditée est
-`/Volumes/MyWorld/monkey.d.labs/coding/riftrHQ/_killix/inspiration_code/atomic`.
-Les preuves sont les commandes déclarées dans
-`atomic-cli/src/main.rs`, les crates du workspace dans `Cargo.toml`, et leurs
-modules publics. L'état Orkia provient du code de ce dépôt et du test
-`cargo test --workspace -q`, exécuté avec succès lors de l'audit (17 tests).
+```text
+Session agent signée
+  └─ intention + tours + actions + lectures/écritures + validations
+       └─ ChangeSet DAG stable
+            ├─ projection mono-repo : branches et PRs empilées
+            └─ projection multi-repo : branches, PRs et dépendances coordonnées
+```
 
-Légende :
+Cette direction fournit deux expériences complémentaires :
 
-| Statut | Sens |
+- **Stack Graphite-like** : chaque ChangeSet est projeté sur une branche Git ;
+  la PR enfant cible la branche de son parent plutôt que `main`. Un changement
+  d’un parent déclenche le restack déterministe des descendants.
+- **Stack multi-repo** : un même DAG peut inclure des ChangeSets dans plusieurs
+  dépôts. Orkia crée et actualise les branches/PRs correspondantes et expose
+  leur état agrégé sans inventer un protocole de contenu concurrent à Git.
+
+## Atomic : inspiration, pas dépendance de stockage
+
+Atomic reste essentiel : il donne les bonnes propriétés à préserver.
+
+| Inspiration Atomic | Traduction Orkia Git-native |
 | --- | --- |
-| Vérifié | Implémenté et couvert par une vérification locale ciblée. |
-| Partiel | Du code existe, mais il ne couvre pas la capacité définie ou n'est pas assemblé. |
-| Absent | Aucune implémentation correspondante trouvée. |
-| Décision | Capacité Atomic qui n'a pas d'équivalent Git-native direct ; une décision produit est requise. |
+| Identités de changement durables | `ChangeSetId` stable, indépendant des hashes de commits réécrits par rebase/restack. |
+| Graphe de dépendances | DAG signé de ChangeSets, parents explicites et fermeture vérifiée. |
+| Concurrence déterministe | Ordre canonique des ChangeSets/opérations, règles fail-closed et tests de convergence multi-clone. |
+| États vivant/supprimé/zombie | Tombstones dans les manifests sémantiques et ChangeSets supersédés, jamais effacés silencieusement. |
+| Provenance complète | Liens session → action → diff → ChangeSet → commit → PR → validation. |
+| Vues et isolation | Branches/worktrees Git et vues Orkia, pas un second espace de travail propriétaire. |
 
-## Verdict actuel
+Orkia ne doit pas reproduire le stockage CRDT d’Atomic ni en faire une seconde
+source de vérité. Les blobs, trees, commits, branches, refs, packs et remotes
+Git restent autoritaires. Lorsqu’une décision sémantique ne peut pas être
+prouvée, Orkia retombe explicitement sur Git normal ; il ne prétend jamais
+avoir résolu une concurrence qu’il ne peut démontrer.
 
-La parité avec Atomic n'est **pas** actuellement respectée. Orkia possède les
-fondations du flux Git-native (ledger signé, capture, extraction d'atomes,
-plan de review, politique et projection GitHub), mais pas encore la profondeur
-fonctionnelle d'Atomic. La capture des agents conserve désormais les sources
-brutes **et** normalise des actions typées pour les huit adaptateurs Orkia.
-Pour les hooks live, une session externe est liée durablement à une session
-Orkia et reçoit des snapshots Git au démarrage puis aux checkpoints/fins. Les
-imports historiques restent volontairement non liés tant qu'ils ne fournissent
-pas un état Git de départ vérifiable.
+## Contrats fondamentaux
 
-Les limites suivantes sont établies par le code actuel :
+### Session agent
 
-- `orkia-agents/src/lib.rs` découvre les transcripts, installe les hooks et
-  produit des `AgentAction` typées (prompt, outil, lecture, écriture, commande
-  et tour/token) pour Claude Code, Codex, Gemini, Kimi, OpenCode, Cursor,
-  Droid et Qwen. Les sources non modifiées restent dans le ledger. Les hooks
-  live lient une session externe, ses actions et ses snapshots Git ; les
-  imports historiques réutilisent une liaison live connue ou restent
-  fail-closed pour la review. Un document identique n'est pas réimporté.
-- `orkia-semantic/src/lib.rs` reconnaît neuf grammaires, mais ses dépendances
-  actuelles sont surtout des heuristiques de même fichier et de tests ; ce
-  n'est pas encore un graphe de références sémantiques.
-- `orkia-git/src/lib.rs` projette des fichiers complets, pas des plages ou
-  atomes intra-commit. `orkia-review/src/lib.rs` contient un plan fermé et
-  fail-closed, mais ses identifiants d'atomes sont recréés à l'extraction.
-- `orkia-server/src/main.rs` expose santé, authentification minimale et
-  réception de webhook ; il n'assemble ni registre de dépôts, ni index
-  Postgres, ni orchestration GitHub App. `orkia-github/src/lib.rs` crée une
-  pull request avec un jeton déjà fourni, sans cycle complet GitHub App.
+Une session possède une intention, un commit de base, des tours/actions
+normalisés, les chemins observés, les commandes, les résultats, les coûts et
+les attestations. Elle peut produire plusieurs ChangeSets, y compris dans des
+dépôts différents.
 
-## Inventaire exhaustif du plan de commande Atomic
+### ChangeSet
 
-Les 37 variantes de `enum Commands` dans `atomic-cli/src/main.rs` constituent
-la surface CLI publiée auditée. Elles sont listées ici pour éviter de perdre
-des capacités dans le découpage de la feuille de route.
+Un ChangeSet est un objet Git immuable et signé qui contient :
 
-| Domaine | Commandes Atomic | Capacité observable |
-| --- | --- | --- |
-| Agent et provenance | `agent`, `intent`, `memory`, `provenance` | Capture d'agents, intention, mémoire, provenance W3C PROV. |
-| Cycle de travail | `init`, `status`, `record`, `revise`, `log`, `diff`, `doctor` | Création, état, enregistrement, révision, historique, diagnostic. |
-| Contenu et changements | `add`, `remove`, `move`, `restore`, `change`, `insert`, `unrecord` | Modifications adressables, insertion, restauration et annulation d'enregistrement. |
-| Isolation et vues | `sandbox`, `split`, `view`, `stash`, `tag` | Espaces isolés, séparation, vues, stash et tags. |
-| Interop Git | `git`, `push`, `pull`, `clone` | Import/interop Git et synchronisation distante. |
-| Identité et organisations | `identity`, `org`, `team` | Identité, organisations et équipes. |
-| Réseau et service | `remote`, `server`, `workspace`, `project`, `update` | Remotes, profil serveur, workspaces, projets et mise à jour. |
-| Recherche et connaissances | `query`, `vault` | Recherche contenu/graphe/entités et coffre de connaissances. |
+- un `ChangeSetId` stable ;
+- sa session d’origine et l’intention concernée ;
+- le dépôt cible et le commit/base Git projeté ;
+- ses parents ChangeSet et dépendances cross-repo ;
+- les opérations/atomes, preuves, validations et attestations ;
+- son état : proposé, actif, supersédé, intégré ou abandonné ;
+- la projection courante : branche, commit et PR, qui peut être remplacée sans
+  changer l’identité du ChangeSet.
 
-## Capacités Atomic par sous-système
+Un rebase, amend ou restack change donc la projection Git mais **pas**
+l’identité, l’historique de review ni la provenance du ChangeSet.
 
-| Sous-système Atomic et preuves | Capacités relevées | Équivalent Orkia actuel | État |
-| --- | --- | --- | --- |
-| `atomic-core/src/crdt/trunk.rs` | CRDT de tronc avec états vivant, supprimé et zombie ; application, diff, merge, pristine, record. | Git conserve le contenu ; `orkia-git` compare et projette. Aucun CRDT Orkia. | Décision |
-| `atomic-repository/src/changestore/mod.rs` et modules `repository/` | Change store adressé par hash, cache, archive, OCI, redb, historique, ignore, insertion, matérialisation, sandbox, tags, tracking, vues. | Ledger signé dans `refs/orkia/ledger`, diff Git et worktree isolé déclaré. Pas de magasin de changements, archive, vue ni tracking équivalents. | Partiel |
-| `atomic-identity` (`delegation`, `keypair`, `signing`, `store`, `usage`) | Identités, clés, signatures, délégation et usage des clés. | `orkia-identity` signe et vérifie en Ed25519 ; aucune délégation ni cycle complet de clés inspecté. | Partiel |
-| `atomic-agent/src/hooks/mod.rs` | Contrat `AgentHook`, détection/install/uninstall ; registre de 15 adaptateurs : Agy, Claude, Cline, Codex, Copilot, Cursor, Devin, Gemini CLI, Grok, Hermes, Kilo, Kiro, OpenCode, Pi, Sherpa. | `orkia-agents` gère huit agents (Claude Code, Codex, Gemini, Kimi, OpenCode, Cursor, Droid, Qwen) et l'installation de hooks. | Partiel |
-| `atomic-agent` (`envelope`, `event`, `export`, `record`, `transcript`, `turn`, `watcher`, `provenance`, `learnings`) | Enveloppes/événements, tours, transcripts, exports, watcher, classification/consolidation de provenance et apprentissages. | Sources brutes plus actions typées pour les huit adaptateurs Orkia ; watcher défini dans `orkia-capture` mais non assemblé ; aucun mapping de session durable ni apprentissage. | Partiel |
-| `atomic-semantic` | Parseurs C++, Go, Java, Python, Rust, Swift, TypeScript/JavaScript ; entités et références. | Les neuf langages sont reconnus dans `orkia-semantic` ; extraction d'atomes limitée et références absentes. | Partiel |
-| `atomic-canonical` (`jcs`, `did`, `proof`, `prov`, `memory`, `gate`, `render`) | Canonicalisation JCS, DID, preuves, PROV, mémoire et gates. | Chaînage SHA-256 et signature Ed25519 dans `orkia-ledger`; sérialisation JSON ordinaire, sans JCS/DID/PROV ni gates canoniques. | Partiel |
-| `atomic-remote` (`http`, `streaming`, `sync`, `storage`, `version`) | Upload/download, requêtes, protocole de streaming, négociation et synchronisation. | Git sync reste disponible au niveau Git ; aucune implémentation Orkia du protocole distant/sync de ledger. | Absent |
-| `atomic-teams` (`org`, `team`, `member`, `grant`) | Organisations, équipes, membres, droits. | Aucune modélisation organisation/équipe/délégation équivalente. | Absent |
-| CLI `query` et modules repository de recherche | Recherche de contenu, graphe, voisins, entités, code, enrichissement. | `orkia-index-postgres` contient une projection/recherche simple, non branchée au serveur et sans graphe sémantique. | Partiel |
-| CLI `vault`, `intent`, `memory` | Coffre, intention, mémoire, compétences et contexte de session. | Objectif de session et prompts sont conservés ; pas de vault/mémoire/intentions versionnés. | Partiel |
-| CLI `sandbox`, `workspace`, `project`, `server` | Espaces de travail, projets, isolations et profil serveur. | Création de worktree Git disponible dans l'adaptateur mais non exposée ni orchestrée ; serveur minimal. | Partiel |
+### Stack
 
-## Cartographie précise des priorités Orkia
+Une stack est une vue ordonnée d’un sous-DAG de ChangeSets. Elle est :
 
-La colonne « responsable » désigne la crate qui doit porter la logique. Les
-composition roots (`orkia-cli`, `orkia-server`) ne doivent pas absorber cette
-logique.
+- **mono-repo** lorsque toutes ses projections vivent dans le même dépôt ;
+- **multi-repo** lorsqu’un parent ou une dépendance traverse un dépôt ;
+- reproductible depuis les objets Git Orkia, même après perte de cache ou de
+  service.
 
-| Priorité | Résultat à livrer | Responsable | Critère d'acceptation vérifiable |
-| --- | --- | --- | --- |
-| P0 | Fixer une matrice de compatibilité Atomic et des fixtures de comportement. | `tests/compat`, toutes crates | Chaque capacité de cet inventaire a un statut, une preuve, un test de non-régression ou une décision explicite. |
-| P0 | Préserver le fail-closed : aucune stack automatique lorsque la capture est incomplète ou la confiance insuffisante. | `orkia-capture`, `orkia-review`, `orkia-policy` | Tests démontrant qu'une écriture inconnue, un transcript incomplet ou une dépendance non résolue produit une review unique. |
-| P1 — en cours | Normaliser les transcripts et hooks en événements causaux typés : tour, prompt, appel/résultat d'outil, fichiers lus/écrits, commande, validation, coût et tokens. Les huit adaptateurs Orkia sont couverts ; il reste les fixtures anonymisées de corpus et la validation croisée de format. | `orkia-agents`, `orkia-capture`, `orkia-model` | Des fixtures réelles, anonymisées, deviennent les mêmes événements de domaine quel que soit le format fournisseur. Aucune unité automatique ne dépend d'un transcript brut. |
-| P1 — en cours | Lier de manière stable la session externe de l'agent à la session Orkia, avec snapshot Git initial/final, hashes de contenu et provenance du hook. Les hooks live ont la liaison append-only, les checkpoints Git et le blocage de couverture en cas d'écriture inconnue. | `orkia-agents`, `orkia-git`, `orkia-ledger` | Relance, import différé et réception de hook ne créent pas de session dupliquée ; le ledger reconstruit la même relation. |
-| P1 | Terminer le cycle hook des huit adaptateurs Riftr déjà présents, puis décider explicitement lesquels des quinze adaptateurs Atomic sont requis. | `orkia-agents` | Installation, désinstallation, idempotence, détection et capture sont testées sur macOS/Linux pour chaque agent retenu. Une capacité non retenue est documentée comme exclusion, non ignorée. |
-| P1 | Brancher le watcher humain et `orkia run` aux mêmes événements typés que les agents. | `orkia-capture` | Toute écriture observée est reliée à une session ; une écriture inconnue dégrade la couverture de façon reproductible. |
-| P2 | Rendre les atomes stables et adressables par contenu/plage/symbole, puis extraire les références/imports/tests/configurations/migrations réelles. | `orkia-semantic`, `orkia-model` | Deux extractions du même arbre produisent les mêmes IDs ; les dépendances de fixtures multi-fichiers correspondent aux références AST attendues. |
-| P2 | Construire le graphe causal : arêtes dures (syntaxe/référence) et souples (capture), score expliqué et fermeture transitive des dépendances. | `orkia-review`, `orkia-semantic`, `orkia-capture` | Le plan est déterministe, fermé sur ses prérequis et explique chaque arête par une preuve versionnée. |
-| P2 | Projeter des patches atomiques, non des fichiers complets, et représenter correctement une unité dépendant de plusieurs unités. | `orkia-git`, `orkia-forge`, `orkia-review` | Un même checkpoint produit plusieurs commits et branches sans perte de changement ; une dépendance multi-parent est reconstruite avec tous ses ancêtres. |
-| P2 | Compléter la décision reviewer : approbation, demande de changements, fusion, scission et révision signée du plan. | `orkia-review`, `orkia-cli`, `orkia-ledger` | Une correction crée une nouvelle révision de plan sans altérer les événements causaux précédents ; le plan aval est reprojeté. |
-| P3 | Rendre le ledger réellement canonique et synchronisable : JCS ou format canonique spécifié, objets append-only, rotation/délégation de clés et reconstruction depuis les refs. | `orkia-ledger`, `orkia-identity`, `orkia-git` | La même suite d'événements donne exactement le même hash sur macOS/Linux ; corruption, réordonnancement et signature non autorisée sont rejetés. |
-| P3 | Exploiter réellement les worktrees concurrents et synchroniser le ledger via Git sans écrasement de producteurs. | `orkia-git`, `orkia-capture` | Deux sessions simultanées sont isolées, publiées puis reconstruites sans perte d'événement. |
-| P3 | Assembler le serveur : registre de dépôts, politiques, index Postgres reconstructible, orchestration et reprise de jobs. | `orkia-server`, `orkia-index-postgres`, `orkia-ports` | La perte de Postgres est réparée intégralement depuis les refs ; l'API peut retrouver dépôt, plan et provenance. |
-| P3 | Livrer le vrai adaptateur GitHub App : JWT/installations, branches, PRs empilées, checks, webhooks et protections. | `orkia-github`, `orkia-forge`, `orkia-server` | Un dépôt de test protégé refuse une intégration sans check/politique Orkia et accepte le chemin `orkia integrate` valide. |
-| P4 | Porter ou décider les capacités Atomic hors cœur de review : query/graphe, vault/mémoire, équipes/grants, remotes, sandbox/vues/tags/stash, archive/OCI. | Crates dédiées à créer si la décision est « porter » | Chaque capacité reçoit « portée », « intégrée via Git », ou « hors périmètre v0.x », avec justification et test lorsque portée. |
-| P4 | Mesurer le résultat sur Ghost PR et en bout-en-bout. | `tests/benchmark`, toutes crates | Gain ≥20 % sur le meilleur baseline, <10 % de paires corrigées séparées, ARI ≥0,8 après split/squash ; matrices Codex/Claude et humain macOS/Linux vertes. |
+## Flux Graphite-like cible
 
-## Ordre d'exécution immédiat : capture des agents
+```text
+main
+ └─ auth-model       (ChangeSet A, PR A → main)
+     └─ auth-api     (ChangeSet B, PR B → auth-model)
+         └─ auth-ui  (ChangeSet C, PR C → auth-api)
+```
 
-Le premier incrément P1 a introduit un contrat de normalisation interne et des
-tests synthétiques pour les huit adaptateurs. Le prochain consiste à figer des
-fixtures anonymisées, issues de chaque format réel, puis à rattacher chaque
-action à un état Git et à une session Orkia stable. Les installateurs de hooks
-ne seront considérés comme parité que lorsque ces deux propriétés sont
-vérifiées sur macOS et Linux.
+1. L’agent crée ou enrichit une session.
+2. Orkia découpe les preuves et diffs observés en ChangeSets explicitement
+   validés par l’utilisateur ou une règle.
+3. Orkia projette chaque ChangeSet sur `orkia/cs/<id>` et crée/met à jour la PR
+   avec la branche de son parent comme base.
+4. Une modification de A entraîne la reprojection de A, puis le rebase/restack
+   déterministe de B et C.
+5. Les branches, PRs, validations et diffs changent ; les `ChangeSetId`,
+   commentaires, preuves et dépendances restent stables.
+6. L’intégration respecte l’ordre topologique et refuse une stack dont un
+   parent est invalide, conflictuel ou insuffisamment validé.
 
-Le contrat cible minimal est :
+## Flux multi-repo cible
 
-1. un identifiant externe stable, scoped par dépôt et fournisseur ;
-2. une suite ordonnée de tours et d'actions typées ;
-3. les fichiers lus, modifiés et leur état Git avant/après ;
-4. les commandes, outils, résultats, erreurs, coût et tokens quand le
-   fournisseur les expose ;
-5. une provenance du format et du fichier source permettant une
-   reconstruction/audit ;
-6. une couverture calculée à partir de preuves observées, jamais supposée.
+```text
+Session « OAuth »
+  ├─ api/auth-model      → dépôt api, PR #120
+  ├─ web/auth-client     → dépôt web, PR #88, dépend de api/auth-model
+  └─ infra/auth-config   → dépôt infra, PR #341, dépend de api/auth-model
+```
 
-## Décisions d'architecture à ne pas masquer
+Chaque dépôt conserve ses commits et PRs Git ordinaires. Le DAG Orkia apporte
+les dépendances qui ne peuvent pas être exprimées par une branche Git unique.
+Le tableau de stack indique l’état de chaque projection et refuse l’intégration
+globale tant que les préconditions inter-dépôts ne sont pas satisfaites.
 
-Atomic peut fusionner au niveau de son CRDT ; Orkia ne doit pas tenter de
-copier ce mécanisme par-dessus Git. Pour Orkia, l'équivalent utile est une
-projection Git déterministe de patches atomiques, avec conflit explicite et
-replanification si les préconditions changent. Les fonctions Atomic de
-magasin, vue, sandbox ou synchronisation doivent donc être classées au cas par
-cas : adaptation Git, nouveau service Orkia, ou exclusion assumée. Les appeler
-« parité » avant cette décision serait trompeur.
+## Feuille de route P0–P7 révisée
 
-La sortie v0.1 ne peut être déclarée qu'après les critères P0 à P4 applicables
-au périmètre retenu. Le présent document doit être mis à jour dans la même
-modification que chaque capacité : preuve source, test exécuté, statut et
-éventuelle décision de périmètre.
+### P0 — Contrats, fixtures et migrations
+
+- Définir les schémas versionnés `Session`, `ChangeSet`, `Stack` et
+  `Projection` avec JSON canonique, signatures et migrations réversibles.
+- Écrire les fixtures : restack à trois niveaux, amend d’un parent,
+  abandon/supersession, dépendance cross-repo, conflits, fetch dans un ordre
+  différent et perte du service/cache.
+- Rendre chaque état de dégradation explicite : Git fallback, conflictuel,
+  preuve manquante ou version incompatible.
+
+**Sortie :** une suite `tests/atomic-parity/` mesure les invariants Atomic
+retenus et une suite `tests/changeset-stacks/` mesure le produit réel.
+
+### P1 — Objets Git et causalité session → ChangeSet
+
+- Finaliser la persistance Git signée des sessions, tours, actions, intentions,
+  mémoires, opérations et attestations.
+- Ajouter `ChangeSet` et `Stack` sous `refs/orkia/*`, avec fermeture des
+  preuves et signatures avant publication.
+- Lier les diffs Git à des actions agent observées, plutôt que les traiter
+  comme des artefacts autonomes.
+
+**Sortie :** un ChangeSet portable explique exactement quelle session et quelles
+preuves ont produit sa projection Git.
+
+### P2 — Identités stables et analyse sémantique
+
+- Stabiliser les identités Trunk/Branch/Leaf et Atom à travers renommage,
+  rebase, restack et modification locale démontrable.
+- Relier les opérations/atomes aux ChangeSets et aux actions agent.
+- Conserver tombstones et alternatives afin qu’un ChangeSet supersédé reste
+  traçable.
+
+**Sortie :** rebase/restack ne casse ni la review ni la provenance.
+
+### P3 — Projection de stacks mono-repo
+
+- Créer les branches `orkia/cs/<id>` et les vues/worktrees associés.
+- Projeter un DAG en branches empilées, avec la branche du parent comme base de
+  PR.
+- Implémenter amend, reorder, split, squash, abandon et restack automatique.
+- Garder des shadow refs Git pour reconstruire les projections sans service.
+
+**Sortie :** une stack Graphite-like est créée, modifiée et restackée
+automatiquement sans changer les identités de ChangeSet.
+
+### P4 — Merge et restack sémantique sûr
+
+- Utiliser l’alignement token-level seulement lorsqu’il est prouvable.
+- Enregistrer les conflits/résolutions comme objets signés reliés aux
+  ChangeSets.
+- Rebaser/restacker les descendants en ordre topologique ; arrêter la stack au
+  premier conflit et fournir la provenance exacte.
+
+**Sortie :** une édition disjointe auto-fusionne ; une concurrence ambiguë
+reste un conflit Git lisible et bloquant.
+
+### P5 — Multi-repo, sync et récupération
+
+- Introduire un registre Git de dépôts/projections et les dépendances
+  cross-repo.
+- Projeter, pousser et récupérer les stacks par refs Git ordinaires.
+- Reconstruire index, projections et statut de stack depuis Git.
+- Finaliser OCI : layout importable, attestations, validations et digests.
+
+**Sortie :** une session produit automatiquement une stack de PRs coordonnée
+sur plusieurs dépôts ; un clone neuf peut la reconstruire.
+
+### P6 — Review, query et expérience agent
+
+- Produire une review par ChangeSet, avec couverture dérivée des actions
+  observées et non d’un simple diff.
+- Afficher session, intention, preuves, coûts, diff, parents/enfants et statut
+  forge dans une même vue.
+- Ajouter recherche/index reconstructible des ChangeSets, symboles et
+  dépendances.
+
+**Sortie :** un reviewer sait pourquoi un changement existe, ce qui l’a produit
+et ce qui doit être intégré avant/après lui.
+
+### P7 — Forge et plan de contrôle
+
+- Créer/mettre à jour PRs GitHub/GitLab pour chaque projection de ChangeSet.
+- Synchroniser la base des PRs lors d’un restack et préserver le lien avec les
+  reviews/commentaires lorsque la forge le permet.
+- Appliquer grants, équipes, expiration, révocation et rotation dans le
+  serveur d’autorisation Git-native.
+- Versionner les profils de dépôt/projet/workspace et négocier le protocole.
+
+**Sortie :** Orkia orchestre une stack complète, contrôlée par la politique,
+depuis une session agent jusqu’à l’intégration topologique des PRs.
+
+## Invariants de sortie
+
+1. **Identité durable :** un ChangeSet garde le même ID à travers restack,
+   rebase et changement de commit projeté.
+2. **Causalité :** toute projection est reliée à une session, à ses preuves et
+   à ses validations ; le mode non capturé est explicitement faible confiance.
+3. **Convergence :** des clones recevant les mêmes refs dans des ordres
+   différents reconstruisent le même DAG et les mêmes projections attendues.
+4. **Interop Git :** chaque branche et PR reste utilisable par Git et la forge
+   sans client Orkia.
+5. **Repli sûr :** sans preuve suffisante, Orkia n’auto-merge ni ne restacke ;
+   il expose le conflit ou le fallback Git.
+6. **Récupération :** supprimer index, cache ou service ne détruit pas les
+   sessions, ChangeSets, stacks ni projections reconstructibles.
+7. **Multi-repo :** une dépendance inter-dépôts est explicite et bloque
+   correctement l’intégration lorsqu’un parent n’est pas prêt.
+
+## État actuel et priorité immédiate
+
+La base Git-native existe déjà : objets sémantiques signés, manifests,
+vues/worktrees, merge prudent, capture agent, plans, vault, grants, rotation,
+révocation, transport de refs, OCI initial et preuve de convergence à deux
+clones.
+
+La priorité immédiate est **P0 puis P1** : introduire le contrat `ChangeSet`
+et les fixtures de stack. C’est le point qui relie les capacités déjà livrées
+au besoin produit : proposer et restacker automatiquement des PRs mono-repo et
+multi-repo à partir d’une session agent.

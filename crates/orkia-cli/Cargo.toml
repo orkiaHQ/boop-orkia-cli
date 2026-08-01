@@ -18,6 +18,7 @@ orkia-forge = { path = "../orkia-forge" }
 orkia-github = { path = "../orkia-github" }
 orkia-git = { path = "../orkia-git" }
 orkia-identity = { path = "../orkia-identity" }
+orkia-index-postgres = { path = "../orkia-index-postgres" }
 orkia-ledger = { path = "../orkia-ledger" }
 orkia-model = { path = "../orkia-model" }
 orkia-ports = { path = "../orkia-ports" }
