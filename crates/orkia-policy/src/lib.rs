@@ -2,6 +2,13 @@
 
 use orkia_model::{OrkiaError, RepositoryPolicy, Result, ReviewPlan, ValidationResult};
 use orkia_ports::ValidationExecutor;
+use std::path::Path;
+
+pub fn load(path: &Path) -> Result<RepositoryPolicy> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| OrkiaError::NotFound(format!("{}: {error}", path.display())))?;
+    toml::from_str(&content).map_err(|error| OrkiaError::Invalid(format!("policy: {error}")))
+}
 
 pub fn evaluate(
     policy: &RepositoryPolicy,

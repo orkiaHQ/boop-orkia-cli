@@ -8,6 +8,7 @@ license.workspace = true
 orkia-model = { path = "../orkia-model" }
 orkia-ports = { path = "../orkia-ports" }
 serde.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true

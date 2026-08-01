@@ -24,6 +24,7 @@ cargo build -p orkia-cli
 ./target/debug/orkia ledger verify
 ./target/debug/orkia review plan
 ./target/debug/orkia review project --plan <plan-id>
+./target/debug/orkia integrate --plan <plan-id> --approvals 1
 ```
 
 For an agent session, Orkia invokes the provider and versions its JSONL output:
@@ -35,6 +36,11 @@ For an agent session, Orkia invokes the provider and versions its JSONL output:
 
 The agent command deliberately persists a failed invocation too: missing causal
 data must reduce confidence rather than silently produce a fragile stack.
+
+An optional, versioned `orkia.toml` configures `protected_branches`,
+`validation_commands`, `minimum_coverage_milli`, `minimum_confidence_milli`
+and `required_approvals`. `orkia integrate` runs those validations and records
+their signed outcomes before permitting integration.
 
 ## Status
 

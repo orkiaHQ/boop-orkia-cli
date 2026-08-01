@@ -44,8 +44,12 @@ enum Command {
         command: ReviewCommand,
     },
     Integrate {
+        #[arg(long)]
+        plan: String,
         #[arg(long, default_value = "main")]
         branch: String,
+        #[arg(long, default_value_t = 0)]
+        approvals: u8,
     },
 }
 #[derive(Subcommand)]
@@ -203,10 +207,23 @@ fn run(cli: Cli) -> Result<()> {
         Command::Review { command } => {
             handle_review(command, &git, &root, &cli.repository, &secrets)?
         }
-        Command::Integrate { branch } => {
-            println!(
-                "integration proposal for {branch} is ready for configured policy and forge checks"
-            );
+        Command::Integrate {
+            plan,
+            branch,
+            approvals,
+        } => {
+            let review: ReviewPlan =
+                read_json(&root.join("orkia/plans").join(format!("{plan}.json")))?;
+            let policy_path = cli.repository.join("orkia.toml");
+            let policy = if policy_path.exists() {
+                orkia_policy::load(&policy_path)?
+            } else {
+                orkia_model::RepositoryPolicy::default()
+            };
+            let ledger = open_repository_ledger(&git, &root, &secrets)?;
+            let validations = run_validations(&cli.repository, &policy, &ledger)?;
+            orkia_policy::evaluate(&policy, &review, &validations, approvals, &branch)?;
+            println!("integration policy passed for {branch}");
         }
     }
     Ok(())
@@ -599,6 +616,37 @@ fn observed_paths(events: &[orkia_model::LedgerEvent]) -> BTreeSet<String> {
             _ => BTreeSet::new(),
         })
         .collect()
+}
+fn run_validations(
+    repository: &Path,
+    policy: &orkia_model::RepositoryPolicy,
+    ledger: &Ledger<orkia_git::GitLedgerStore, SystemClock>,
+) -> Result<Vec<orkia_model::ValidationResult>> {
+    let mut results = Vec::new();
+    for command in &policy.validation_commands {
+        let output = std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(command)
+            .current_dir(repository)
+            .output()
+            .map_err(|error| OrkiaError::External(format!("validation {command}: {error}")))?;
+        let result = orkia_model::ValidationResult {
+            command: command.clone(),
+            passed: output.status.success(),
+            output: format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        };
+        ledger.append(CaptureEvent::Validation {
+            command: result.command.clone(),
+            passed: result.passed,
+            output: result.output.clone(),
+        })?;
+        results.push(result);
+    }
+    Ok(results)
 }
 fn load_identity(root: &Path, secrets: &FileSecrets) -> Result<Identity> {
     let actor: Actor = read_json(&root.join("orkia/actor.json"))?;

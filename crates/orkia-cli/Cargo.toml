@@ -19,6 +19,7 @@ orkia-identity = { path = "../orkia-identity" }
 orkia-ledger = { path = "../orkia-ledger" }
 orkia-model = { path = "../orkia-model" }
 orkia-ports = { path = "../orkia-ports" }
+orkia-policy = { path = "../orkia-policy" }
 orkia-review = { path = "../orkia-review" }
 orkia-semantic = { path = "../orkia-semantic" }
 serde.workspace = true
