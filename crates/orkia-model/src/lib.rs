@@ -71,6 +71,24 @@ pub enum CaptureEvent {
         arguments: serde_json::Value,
         result: serde_json::Value,
     },
+    /// The unmodified payload delivered by a native coding-agent hook.  Keeping
+    /// it whole makes a new upstream field durable before Orkia has learned to
+    /// interpret it, and preserves agent-specific provenance for reconstruction.
+    AgentHook {
+        agent: String,
+        external_session: Option<String>,
+        hook_event: String,
+        cwd: Option<String>,
+        payload: serde_json::Value,
+    },
+    /// An unmodified local transcript document from a supported coding agent.
+    /// Binary sources (Cursor's SQLite database) are base64-encoded.
+    AgentTranscript {
+        agent: String,
+        path: String,
+        encoding: String,
+        content: String,
+    },
     FilesObserved {
         read: BTreeSet<String>,
         modified: BTreeSet<String>,
@@ -257,6 +275,8 @@ pub fn event_kind(event: &CaptureEvent) -> &'static str {
         CaptureEvent::Prompt { .. } => "prompt",
         CaptureEvent::Transcript { .. } => "transcript",
         CaptureEvent::ToolCall { .. } => "tool_call",
+        CaptureEvent::AgentHook { .. } => "agent_hook",
+        CaptureEvent::AgentTranscript { .. } => "agent_transcript",
         CaptureEvent::FilesObserved { .. } => "files_observed",
         CaptureEvent::Command { .. } => "command",
         CaptureEvent::Validation { .. } => "validation",

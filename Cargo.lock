@@ -1146,6 +1146,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "orkia-agents"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "orkia-model",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml_edit",
+]
+
+[[package]]
 name = "orkia-capture"
 version = "0.1.0"
 dependencies = [
@@ -1160,8 +1172,10 @@ dependencies = [
 name = "orkia-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "git2",
+ "orkia-agents",
  "orkia-capture",
  "orkia-forge",
  "orkia-git",

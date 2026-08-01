@@ -10,8 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+base64.workspace = true
 git2.workspace = true
 orkia-capture = { path = "../orkia-capture" }
+orkia-agents = { path = "../orkia-agents" }
 orkia-forge = { path = "../orkia-forge" }
 orkia-github = { path = "../orkia-github" }
 orkia-git = { path = "../orkia-git" }

@@ -1,6 +1,11 @@
 //! Terminal composition root for Orkia.
 
+use base64::Engine;
 use clap::{Parser, Subcommand, ValueEnum};
+use orkia_agents::{
+    Agent as SupportedAgent, all_statuses, install as install_agent, parse_hook_payload,
+    status as agent_status, transcript_files, uninstall as uninstall_agent,
+};
 use orkia_capture::{ClaudeAdapter, CodexAdapter, ProviderAdapter};
 use orkia_git::LibGit2Repository;
 use orkia_github::GitHubApp;
@@ -35,6 +40,11 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    /// Native coding-agent support matching Riftr CLI's measured matrix.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     Ledger {
         #[command(subcommand)]
         command: LedgerCommand,
@@ -50,6 +60,33 @@ enum Command {
         branch: String,
         #[arg(long, default_value_t = 0)]
         approvals: u8,
+    },
+}
+#[derive(Subcommand)]
+enum AgentCommand {
+    List,
+    /// Import native transcript documents for a Riftr-supported agent.
+    Import {
+        #[arg(long)]
+        agent: String,
+    },
+    Status {
+        #[arg(long)]
+        agent: String,
+    },
+    Install {
+        #[arg(long)]
+        agent: String,
+    },
+    Uninstall {
+        #[arg(long)]
+        agent: String,
+    },
+    /// Entry point invoked by native agent hooks. Errors are never allowed to
+    /// block the agent process that invoked it.
+    Hook {
+        #[arg(long)]
+        agent: String,
     },
 }
 #[derive(Subcommand)]
@@ -170,7 +207,17 @@ impl SecretStore for FileSecrets {
 }
 
 fn main() {
-    if let Err(error) = run(Cli::parse()) {
+    let cli = Cli::parse();
+    let fail_safe_hook = matches!(
+        &cli.command,
+        Command::Agent {
+            command: AgentCommand::Hook { .. }
+        }
+    );
+    if let Err(error) = run(cli) {
+        if fail_safe_hook {
+            return;
+        }
         eprintln!("orkia: {error}");
         std::process::exit(1);
     }
@@ -190,11 +237,13 @@ fn run(cli: Cli) -> Result<()> {
             let identity = Identity::generate(name);
             identity.save(&secrets, "identity")?;
             write_json(&root.join("orkia/actor.json"), identity.actor())?;
+            write_json(&root.join("orkia/repository.json"), &RepositoryId::new())?;
             println!("identity {} initialized", identity.actor().id.0);
         }
         Command::Session { command } => {
             handle_session(command, &git, &root, &secrets, &cli.repository)?
         }
+        Command::Agent { command } => handle_agent(command, &git, &root, &secrets)?,
         Command::Ledger {
             command: LedgerCommand::Verify,
         } => {
@@ -228,6 +277,149 @@ fn run(cli: Cli) -> Result<()> {
     }
     Ok(())
 }
+
+fn supported_agent(name: &str) -> Result<SupportedAgent> {
+    SupportedAgent::parse(name).ok_or_else(|| OrkiaError::Invalid(format!("unknown agent {name}")))
+}
+
+fn handle_agent(
+    command: AgentCommand,
+    git: &LibGit2Repository,
+    root: &Path,
+    secrets: &FileSecrets,
+) -> Result<()> {
+    match command {
+        AgentCommand::List => {
+            for status in all_statuses() {
+                println!(
+                    "{}\ttranscripts={}\thooks={}\tpresent={}",
+                    status.agent.name(),
+                    status.agent.supports_transcripts(),
+                    status.agent.supports_hooks(),
+                    status.present
+                );
+            }
+        }
+        AgentCommand::Import { agent } => {
+            let agent = supported_agent(&agent)?;
+            let ledger = open_repository_ledger(git, root, secrets)?;
+            let files = transcript_files(agent).map_err(OrkiaError::External)?;
+            for file in &files {
+                let bytes = fs::read(&file.path).map_err(|error| {
+                    OrkiaError::External(format!("{}: {error}", file.path.display()))
+                })?;
+                let (encoding, content) = if file.binary {
+                    (
+                        "base64".into(),
+                        base64::engine::general_purpose::STANDARD.encode(bytes),
+                    )
+                } else {
+                    ("utf-8".into(), String::from_utf8_lossy(&bytes).into_owned())
+                };
+                ledger.append(CaptureEvent::AgentTranscript {
+                    agent: agent.name().into(),
+                    path: file.path.to_string_lossy().into_owned(),
+                    encoding,
+                    content,
+                })?;
+            }
+            println!(
+                "imported {} {} transcript document(s)",
+                files.len(),
+                agent.name()
+            );
+        }
+        AgentCommand::Status { agent } => {
+            let status = agent_status(supported_agent(&agent)?);
+            println!(
+                "{}\tpresent={}\ttranscript_root={}\thooks={}\twired_to={}",
+                status.agent.name(),
+                status.present,
+                status
+                    .transcript_root
+                    .as_deref()
+                    .map(Path::display)
+                    .map(|path| path.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                status
+                    .hooks_path
+                    .as_deref()
+                    .map(Path::display)
+                    .map(|path| path.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                status.wired_to.unwrap_or_else(|| "-".into()),
+            );
+        }
+        AgentCommand::Install { agent } => {
+            let executable = std::env::current_exe()
+                .map_err(|error| OrkiaError::External(format!("current executable: {error}")))?;
+            let change = install_agent(supported_agent(&agent)?, &executable)
+                .map_err(OrkiaError::External)?;
+            println!(
+                "installed {} hook event(s): {}",
+                change.added.len(),
+                change.added.join(",")
+            );
+            for note in change.notes {
+                println!("{note}");
+            }
+        }
+        AgentCommand::Uninstall { agent } => {
+            let change = uninstall_agent(supported_agent(&agent)?).map_err(OrkiaError::External)?;
+            println!(
+                "removed {} hook event(s): {}",
+                change.removed.len(),
+                change.removed.join(",")
+            );
+            for note in change.notes {
+                println!("{note}");
+            }
+        }
+        AgentCommand::Hook { agent } => {
+            let agent = supported_agent(&agent)?;
+            let mut raw = String::new();
+            use std::io::Read;
+            std::io::stdin()
+                .read_to_string(&mut raw)
+                .map_err(|error| OrkiaError::External(error.to_string()))?;
+            let payload = parse_hook_payload(agent, &raw).map_err(OrkiaError::Invalid)?;
+            let ledger = open_repository_ledger(git, root, secrets)?;
+            if payload.event == "SessionStart" {
+                ledger.append(CaptureEvent::SessionStarted {
+                    session: SessionId::new(),
+                    origin: match agent {
+                        SupportedAgent::Codex => CaptureOrigin::Codex,
+                        SupportedAgent::ClaudeCode => CaptureOrigin::Claude,
+                        _ => CaptureOrigin::Unknown,
+                    },
+                    base_commit: git.head_commit()?,
+                    objective: format!(
+                        "{} agent session {}",
+                        agent.name(),
+                        payload.session_id.as_deref().unwrap_or("unknown")
+                    ),
+                })?;
+            }
+            if payload.event == "UserPromptSubmit" {
+                if let Some(content) = payload.prompt.clone() {
+                    ledger.append(CaptureEvent::Prompt {
+                        provider: agent.name().into(),
+                        content,
+                    })?;
+                }
+            }
+            ledger.append(CaptureEvent::AgentHook {
+                agent: agent.name().into(),
+                external_session: payload.session_id,
+                hook_event: payload.event,
+                cwd: payload.cwd.map(|path| path.to_string_lossy().into_owned()),
+                payload: payload.raw,
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn handle_session(
     command: SessionCommand,
     git: &LibGit2Repository,
@@ -239,9 +431,10 @@ fn handle_session(
         SessionCommand::Start { objective, origin } => {
             let identity = load_identity(root, secrets)?;
             let base_commit = git.head_commit()?;
+            let repository: RepositoryId = read_json(&root.join("orkia/repository.json"))?;
             let state = SessionState {
                 id: SessionId::new(),
-                repository: RepositoryId::new(),
+                repository: repository.clone(),
                 actor: identity.actor().clone(),
                 base_commit: base_commit.clone(),
                 observed_paths: BTreeSet::new(),
@@ -558,10 +751,8 @@ fn open_repository_ledger(
     let events = git.ledger_store().read_all()?;
     let repository = events
         .first()
-        .ok_or_else(|| OrkiaError::NotFound("ledger events".into()))?
-        .unsigned
-        .repository
-        .clone();
+        .map(|event| event.unsigned.repository.clone())
+        .unwrap_or(read_json(&root.join("orkia/repository.json"))?);
     let actor: Actor = read_json(&root.join("orkia/actor.json"))?;
     let identity = Identity::load(secrets, "identity", actor)?
         .ok_or_else(|| OrkiaError::NotFound("Orkia identity".into()))?;
