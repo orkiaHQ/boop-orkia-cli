@@ -132,6 +132,12 @@ impl LibGit2Repository {
             .map_err(git_error)?;
         Ok(commit.to_string())
     }
+    pub fn push_branch(&self, remote: &str, branch: &str) -> Result<()> {
+        let repo = self.repo()?;
+        let mut remote = repo.find_remote(remote).map_err(git_error)?;
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        remote.push(&[&refspec], None).map_err(git_error)
+    }
 }
 
 fn changed_lines(old: &str, new: &str) -> (u32, u32) {
@@ -236,5 +242,27 @@ mod tests {
         let git = LibGit2Repository::open(dir.path()).unwrap();
         git.write_ledger(b"[]").unwrap();
         assert_eq!(git.read_ledger().unwrap(), Some(b"[]".to_vec()));
+    }
+
+    #[test]
+    fn pushes_projected_branch_to_a_local_remote() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let remote_dir = tempfile::tempdir().unwrap();
+        Repository::init_bare(remote_dir.path()).unwrap();
+        let repo = Repository::init(source_dir.path()).unwrap();
+        let signature = Signature::now("test", "test@example.com").unwrap();
+        let tree_id = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .unwrap();
+        repo.remote("origin", remote_dir.path().to_str().unwrap())
+            .unwrap();
+        drop(tree);
+        drop(repo);
+        let git = LibGit2Repository::open(source_dir.path()).unwrap();
+        git.project_branch("orkia/test", "HEAD").unwrap();
+        git.push_branch("origin", "orkia/test").unwrap();
+        let remote = Repository::open_bare(remote_dir.path()).unwrap();
+        assert!(remote.find_reference("refs/heads/orkia/test").is_ok());
     }
 }

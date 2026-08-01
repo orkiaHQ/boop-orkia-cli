@@ -3,12 +3,13 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use orkia_capture::{ClaudeAdapter, CodexAdapter, ProviderAdapter};
 use orkia_git::LibGit2Repository;
+use orkia_github::GitHubApp;
 use orkia_identity::Identity;
 use orkia_ledger::{Ledger, SystemClock, verify_chain};
 use orkia_model::{
     Actor, CaptureEvent, CaptureOrigin, OrkiaError, RepositoryId, Result, ReviewPlan, SessionId,
 };
-use orkia_ports::{GitRepository, LedgerStore, SecretStore};
+use orkia_ports::{Forge, GitRepository, LedgerStore, SecretStore};
 use orkia_review::{PlanningInput, plan};
 use orkia_semantic::{ChangedFile, extract_atoms, infer_dependencies};
 use serde::{Deserialize, Serialize};
@@ -104,6 +105,18 @@ enum ReviewCommand {
     Project {
         #[arg(long)]
         plan: String,
+    },
+    Publish {
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        github_owner: String,
+        #[arg(long)]
+        github_repository: String,
+        #[arg(long, default_value = "main")]
+        base: String,
+        #[arg(long, default_value = "origin")]
+        remote: String,
     },
 }
 #[derive(Clone, Copy, ValueEnum)]
@@ -484,6 +497,24 @@ fn handle_review(
                 let commit = git.project_paths(&projection.branch, &parent, &paths)?;
                 commits.insert(projection.branch.clone(), commit.clone());
                 println!("{} -> {}", projection.branch, commit);
+            }
+        }
+        ReviewCommand::Publish {
+            plan: plan_id,
+            github_owner,
+            github_repository,
+            base,
+            remote,
+        } => {
+            let token = std::env::var("ORKIA_GITHUB_INSTALLATION_TOKEN")
+                .map_err(|_| OrkiaError::NotFound("ORKIA_GITHUB_INSTALLATION_TOKEN".into()))?;
+            let plan: ReviewPlan =
+                read_json(&root.join("orkia/plans").join(format!("{plan_id}.json")))?;
+            let github = GitHubApp::new(github_owner, github_repository, token)?;
+            for projection in orkia_forge::projections(&plan, &base)? {
+                git.push_branch(&remote, &projection.branch)?;
+                let url = github.publish(&projection)?;
+                println!("{}", url);
             }
         }
     }

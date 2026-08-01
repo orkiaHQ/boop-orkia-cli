@@ -1165,6 +1165,7 @@ dependencies = [
  "orkia-capture",
  "orkia-forge",
  "orkia-git",
+ "orkia-github",
  "orkia-identity",
  "orkia-ledger",
  "orkia-model",

@@ -13,6 +13,7 @@ clap.workspace = true
 git2.workspace = true
 orkia-capture = { path = "../orkia-capture" }
 orkia-forge = { path = "../orkia-forge" }
+orkia-github = { path = "../orkia-github" }
 orkia-git = { path = "../orkia-git" }
 orkia-identity = { path = "../orkia-identity" }
 orkia-ledger = { path = "../orkia-ledger" }
