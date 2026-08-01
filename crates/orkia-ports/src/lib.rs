@@ -1,6 +1,8 @@
 //! Inward-facing contracts. Implementations belong to infrastructure crates.
 
-use orkia_model::{ForgeReview, LedgerEvent, RepositoryPolicy, Result, ReviewPlan, ValidationResult};
+use orkia_model::{
+    ForgeReview, LedgerEvent, RepositoryPolicy, Result, ReviewPlan, ValidationResult,
+};
 
 pub trait LedgerStore: Send + Sync {
     fn append(&self, event: &LedgerEvent) -> Result<()>;
@@ -29,7 +31,9 @@ pub trait SecretStore: Send + Sync {
     fn put(&self, key: &str, value: &[u8]) -> Result<()>;
 }
 
-pub trait Clock: Send + Sync { fn now(&self) -> time::OffsetDateTime; }
+pub trait Clock: Send + Sync {
+    fn now(&self) -> time::OffsetDateTime;
+}
 
 pub trait ValidationExecutor: Send + Sync {
     fn execute(&self, policy: &RepositoryPolicy) -> Result<Vec<ValidationResult>>;

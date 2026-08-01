@@ -1163,6 +1163,7 @@ dependencies = [
  "clap",
  "git2",
  "orkia-capture",
+ "orkia-forge",
  "orkia-git",
  "orkia-identity",
  "orkia-ledger",

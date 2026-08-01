@@ -22,7 +22,8 @@ cargo build -p orkia-cli
 ./target/debug/orkia session run -- cargo test --workspace
 ./target/debug/orkia session checkpoint
 ./target/debug/orkia ledger verify
-./target/debug/orkia review plan --path src/lib.rs
+./target/debug/orkia review plan
+./target/debug/orkia review project --plan <plan-id>
 ```
 
 For an agent session, Orkia invokes the provider and versions its JSONL output:
