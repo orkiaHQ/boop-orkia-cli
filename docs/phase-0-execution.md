@@ -44,7 +44,9 @@ Verified on 2026-08-01:
 - The Phase 0 operations view is data-driven: it displays the actual signed
   proof count, signer, stack/dependency counts and backend validation state;
   unavailable runtime projections are labeled as unavailable rather than
-  filled with sample records (frontend commit `d7a164a`).
+  filled with sample records (frontend commits `d7a164a`, `e9fcea1`). The
+  authenticated home view also renders only live repositories and backend
+  activity, with explicit empty states.
 - `orkia init --create-git` creates a repository when needed, writes and
   validates a default `orkia.toml`, and reports the policy/ref/backend wiring.
 - `orkia init` publishes the Ed25519 actor certificate at
