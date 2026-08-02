@@ -6,15 +6,16 @@ phase is complete.
 ## Repositories
 
 The three public repositories exist under `orkiaHQ`, use `main`, and have
-protected branches with the CI `build` check required:
+protected branches with their repository CI checks required:
 
 - `orkiaHQ/boop-orkia-backend` — `https://github.com/orkiaHQ/boop-orkia-backend`
 - `orkiaHQ/boop-orkia-frontend` — `https://github.com/orkiaHQ/boop-orkia-frontend`
 - `orkiaHQ/boop-orkia-cli` — `https://github.com/orkiaHQ/boop-orkia-cli`
 
 Issues are enabled; Projects and Wiki are disabled. The initial repository
-commits and CI runs are retained in GitHub. Bootstrap documentation is being
-merged through `boop/e2e/bootstrap-docs` pull requests.
+commits and CI runs are retained in GitHub. Bootstrap documentation was merged
+through `boop/e2e/bootstrap-docs` pull requests: backend `384a7d2`, frontend
+`a591d4b`, and CLI `05d35d8`.
 
 ## Local vertical slice
 
@@ -44,6 +45,14 @@ Evidence from that clone:
   `refs/orkia/stack-prs/*` were created;
 - the absolute file path emitted by Codex is correlated with Git's relative
   path by the regression-tested path normalizer.
+
+The same no-manual-session scenario was also run in fresh initialized clones
+of the frontend and CLI repositories. Their evidence is:
+
+- frontend: `orkia ledger verify` reported `19` signed events and
+  `orkia review plan` reported one atom, one unit, coverage `1000‰`;
+- CLI: `orkia ledger verify` reported `19` signed events and
+  `orkia review plan` reported one atom, one unit, coverage `1000‰`.
 
 ## Remaining Phase 0 gates
 

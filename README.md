@@ -31,6 +31,7 @@ The current executable evidence and remaining release proofs are tracked in
 
 ```sh
 cargo build -p orkia-cli
+./target/debug/orkia init --agent codex --name "Orkia workstation"
 ./target/debug/orkia identity init --name "Ada"
 ./target/debug/orkia session start --objective "Add the parser"
 ./target/debug/orkia session run -- cargo test --workspace
