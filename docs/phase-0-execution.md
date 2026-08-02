@@ -56,6 +56,9 @@ Verified on 2026-08-01:
   `refs/orkia/actors/<actor-id>` and verifies the complete ledger before it
   reports success. This makes a fresh clone independently verifiable rather
   than trusting a local key file.
+- `scripts/e2e_init_matrix.sh` exercises fresh repositories, existing clones,
+  idempotent re-entry, identity protection, preservation of foreign hooks,
+  offline repositories, corrupt semantic refs and read-only metadata.
 - CLI workspace tests and Clippy pass; the real CLI binary is built. Automatic
   checkpoints run the deterministic default validation `git diff --check` (or
   the repository's configured commands), store each result in every
