@@ -44,6 +44,10 @@ Verified on 2026-08-01:
 - The frontend now queries `repositoryCanonicalChangeSets` and renders a
   separate ledger-backed canonical ChangeSet card; detector output remains
   explicitly labeled as an evidence projection.
+- Each signed ChangeSet proof now carries the exact source session ID and the
+  number of validations on the selected Stack revision. The operations view
+  renders those values from the verified backend payload; it does not infer
+  provenance from repository or branch names.
 - The Phase 0 operations view is data-driven: it displays the actual signed
   proof count, signer, stack/dependency counts and backend validation state;
   unavailable runtime projections are labeled as unavailable rather than

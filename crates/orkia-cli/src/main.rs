@@ -333,8 +333,16 @@ struct WireChangeSetProof {
     repository_id: RepositoryId,
     stack_id: StackId,
     revision: u32,
+    /// The causal session that produced the exact Stack revision.  Keeping
+    /// this in the signed wire payload lets the backend/UI show provenance
+    /// without pretending that a ChangeSet itself is a session.
+    session_id: SessionId,
+    validation_count: usize,
     refs: Vec<String>,
 }
+
+type ChangeSetProofKey = (RepositoryId, StackId, u32);
+type ChangeSetProofMetadata = (SessionId, usize);
 
 #[derive(Serialize)]
 struct WireChangeSetPayload {
@@ -1721,7 +1729,7 @@ fn handle_changeset(
                     objective,
                     current.stacks.len()
                 );
-                maybe_submit_changeset(&current, &identity)?;
+                maybe_submit_changeset(&current, &identity, &repository_path)?;
                 return Ok(());
             }
             let object = git
@@ -1733,7 +1741,7 @@ fn handle_changeset(
                 revision: change_set.revision,
                 object,
             })?;
-            maybe_submit_changeset(&change_set, &identity)?;
+            maybe_submit_changeset(&change_set, &identity, &repository_path)?;
             println!(
                 "changeset {} revision {} automatically coordinated objective=`{}` repositories={}",
                 change_set.id.0,
@@ -1817,7 +1825,8 @@ fn handle_changeset(
                 revision: change_set.revision,
                 object,
             })?;
-            maybe_submit_changeset(&change_set, &identity)?;
+            let repository_paths = repository_paths.values().cloned().collect::<Vec<_>>();
+            maybe_submit_changeset(&change_set, &identity, &repository_paths)?;
             println!(
                 "changeset {} revision {} published",
                 change_set.id.0, change_set.revision
@@ -2718,7 +2727,12 @@ fn persist_review_plan(
         atom_count: plan.atoms.len() as u32,
         coverage_milli: plan.coverage_milli,
     })?;
-    maybe_submit_changeset(&change_set, &identity)?;
+    let repository_path_buf = repository_path.to_path_buf();
+    maybe_submit_changeset(
+        &change_set,
+        &identity,
+        std::slice::from_ref(&repository_path_buf),
+    )?;
     maybe_auto_project_and_publish(git, root, repository_path, secrets, &plan.id);
     maybe_auto_coordinate_changeset(git, root, repository_path, secrets);
     Ok(())
@@ -2818,7 +2832,11 @@ fn maybe_auto_coordinate_changeset(
 /// Submit the signed, content-free ChangeSet envelope when a backend is
 /// configured. Offline repositories remain fully functional; publication is
 /// retried by the same deterministic payload on the next checkpoint.
-fn maybe_submit_changeset(change_set: &orkia_model::ChangeSet, identity: &Identity) -> Result<()> {
+fn maybe_submit_changeset(
+    change_set: &orkia_model::ChangeSet,
+    identity: &Identity,
+    repository_paths: &[PathBuf],
+) -> Result<()> {
     let Some(base_url) = std::env::var_os("ORKIA_BACKEND_URL") else {
         return Ok(());
     };
@@ -2832,21 +2850,38 @@ fn maybe_submit_changeset(change_set: &orkia_model::ChangeSet, identity: &Identi
             revision: stack.revision,
         })
         .collect::<Vec<_>>();
+    let proof_metadata = changeset_proof_metadata(change_set, repository_paths)?;
     let proofs = stacks
         .iter()
-        .map(|stack| WireChangeSetProof {
-            repository_id: stack.repository_id.clone(),
-            stack_id: stack.stack_id.clone(),
-            revision: stack.revision,
-            refs: vec![
-                format!("refs/orkia/stacks/{}/{}", stack.stack_id.0, stack.revision),
-                format!(
-                    "refs/orkia/changesets/{}/{}",
-                    change_set.id.0, change_set.revision
-                ),
-            ],
+        .map(|stack| {
+            let metadata = proof_metadata
+                .get(&(
+                    stack.repository_id.clone(),
+                    stack.stack_id.clone(),
+                    stack.revision,
+                ))
+                .ok_or_else(|| {
+                    OrkiaError::Integrity(format!(
+                        "missing causal metadata for ChangeSet stack {} revision {}",
+                        stack.stack_id.0, stack.revision
+                    ))
+                })?;
+            Ok(WireChangeSetProof {
+                repository_id: stack.repository_id.clone(),
+                stack_id: stack.stack_id.clone(),
+                revision: stack.revision,
+                session_id: metadata.0.clone(),
+                validation_count: metadata.1,
+                refs: vec![
+                    format!("refs/orkia/stacks/{}/{}", stack.stack_id.0, stack.revision),
+                    format!(
+                        "refs/orkia/changesets/{}/{}",
+                        change_set.id.0, change_set.revision
+                    ),
+                ],
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     let payload = WireChangeSetPayload {
         wire_version: 1,
         signer_id: identity.actor().id.0,
@@ -2898,6 +2933,77 @@ fn maybe_submit_changeset(change_set: &orkia_model::ChangeSet, identity: &Identi
         change_set.id.0, change_set.revision
     );
     Ok(())
+}
+
+/// Reconstruct the provenance of each exact Stack revision before submitting
+/// a ChangeSet.  The backend receives only signed metadata; the authoritative
+/// session and validation values are read from the repository's signed Git
+/// objects, never inferred from a branch name or a client-side cache.
+fn changeset_proof_metadata(
+    change_set: &orkia_model::ChangeSet,
+    repository_paths: &[PathBuf],
+) -> Result<BTreeMap<ChangeSetProofKey, ChangeSetProofMetadata>> {
+    let mut repositories = BTreeMap::<RepositoryId, (LibGit2Repository, RepositoryPolicy)>::new();
+    for path in repository_paths {
+        let root = git_dir(path)?;
+        let repository: RepositoryId = read_json(&root.join("orkia/repository.json"))?;
+        if repositories.contains_key(&repository) {
+            continue;
+        }
+        let git = LibGit2Repository::open(path)?;
+        let policy = load_repository_policy(path)?;
+        repositories.insert(repository, (git, policy));
+    }
+    let mut metadata = BTreeMap::new();
+    for stack in &change_set.stacks {
+        let (git, policy) = repositories.get(&stack.repository).ok_or_else(|| {
+            OrkiaError::NotFound(format!(
+                "repository {} is not available for ChangeSet provenance",
+                stack.repository.0
+            ))
+        })?;
+        let Some((_, stored_stack)) =
+            git.semantic_store()
+                .stack_at_revision(&stack.stack, stack.revision, policy)?
+        else {
+            return Err(OrkiaError::NotFound(format!(
+                "stack {} revision {} for ChangeSet provenance",
+                stack.stack.0, stack.revision
+            )));
+        };
+        let mut sessions = BTreeSet::new();
+        let mut validation_count = 0;
+        for (pull_request_id, pull_request_revision) in &stored_stack.pull_request_revisions {
+            let Some((_, pull_request)) = git.semantic_store().stack_pull_request_at_revision(
+                pull_request_id,
+                *pull_request_revision,
+                policy,
+            )?
+            else {
+                return Err(OrkiaError::NotFound(format!(
+                    "stack pull request {} revision {} for ChangeSet provenance",
+                    pull_request_id.0, pull_request_revision
+                )));
+            };
+            sessions.insert(pull_request.session);
+            validation_count += pull_request.validations.len();
+        }
+        let Some(session) = sessions.into_iter().next() else {
+            return Err(OrkiaError::Integrity(format!(
+                "stack {} revision {} has no causal session",
+                stack.stack.0, stack.revision
+            )));
+        };
+        metadata.insert(
+            (
+                stack.repository.clone(),
+                stack.stack.clone(),
+                stack.revision,
+            ),
+            (session, validation_count),
+        );
+    }
+    Ok(metadata)
 }
 
 fn load_repository_policy(repository: &Path) -> Result<orkia_model::RepositoryPolicy> {
