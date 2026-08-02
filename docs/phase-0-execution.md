@@ -94,6 +94,11 @@ plan, stack, projection, GitHub PR and ChangeSet automatically:
   PR [#6](https://github.com/orkiaHQ/boop-orkia-frontend/pull/6) and CLI PR
   [#7](https://github.com/orkiaHQ/boop-orkia-cli/pull/7) were created by the
   automatic publication path and all required CI jobs passed;
+- the frontend data-driven operations hardening is isolated in PR
+  [#7](https://github.com/orkiaHQ/boop-orkia-frontend/pull/7) (commit
+  `d7a164a`) and the clone-verification hardening is isolated in CLI PR
+  [#8](https://github.com/orkiaHQ/boop-orkia-cli/pull/8); both have passing CI
+  and remain open for the required human review on protected `main`;
 - publication authentication used the configured GitHub installation token;
   the local OAuth dashboard flow was also exercised against the running stack.
 - The backend registry is bound to the real `orkiaHQ` namespace and GitHub
@@ -115,6 +120,10 @@ ChangeSet `999f94b1-6885-52a5-b9a0-de715426d297`: `orkia changeset show` returne
 three stacks and `orkia changeset status` over the three clones returned
 `ready_for_integration: true`, with all three stack PRs published and a
 deterministic execution order.
+
+The generated stack PRs are intentionally not merged by this scenario;
+protected `main` still requires the configured human approval and Orkia
+integration check.
 
 The Git remote round-trip test covers this transport, including blob/tree
 semantic objects transported as lightweight tags.
