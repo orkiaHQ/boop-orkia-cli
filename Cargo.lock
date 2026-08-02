@@ -1436,10 +1436,12 @@ dependencies = [
  "orkia-projection",
  "orkia-review",
  "orkia-semantic",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "time",
+ "toml",
  "uuid",
 ]
 
