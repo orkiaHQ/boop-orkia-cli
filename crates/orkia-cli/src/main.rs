@@ -2988,6 +2988,12 @@ fn changeset_proof_metadata(
             sessions.insert(pull_request.session);
             validation_count += pull_request.validations.len();
         }
+        if sessions.len() != 1 {
+            return Err(OrkiaError::Integrity(format!(
+                "stack {} revision {} spans multiple causal sessions",
+                stack.stack.0, stack.revision
+            )));
+        }
         let Some(session) = sessions.into_iter().next() else {
             return Err(OrkiaError::Integrity(format!(
                 "stack {} revision {} has no causal session",
