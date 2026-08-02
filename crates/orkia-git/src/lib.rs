@@ -14,10 +14,10 @@ use git2::{
 };
 use orkia_identity::{Identity, verify};
 use orkia_model::{
-    AccessGrant, Attestation, ChangeSet, ChangeSetId, FileChange, GrantRevocation, GrantRole,
-    Intent, KeyRotation, LedgerEvent, Memory, MergeOutcome, MergeResolution, Organization,
-    OrkiaError, PlanId, Projection, ProjectionId, RepositoryPolicy, Result, ReviewPlan,
-    SemanticDocument, SemanticObjectKind, SemanticObjectRef, SemanticOperation,
+    AccessGrant, Actor, Attestation, ChangeSet, ChangeSetId, FileChange, GrantRevocation,
+    GrantRole, Intent, KeyRotation, LedgerEvent, Memory, MergeOutcome, MergeResolution,
+    Organization, OrkiaError, PlanId, Projection, ProjectionId, RepositoryPolicy, Result,
+    ReviewPlan, SemanticDocument, SemanticObjectKind, SemanticObjectRef, SemanticOperation,
     SemanticOperationAction, SemanticSignature, SemanticState, SessionId, Stack, StackId,
     StackPullRequest, StackPullRequestId, Team, TrunkState, VaultEntry, ViewMetadata,
     valid_vault_name,
@@ -41,6 +41,8 @@ pub const LEGACY_LEDGER_ROOT_REF: &str = "refs/orkia/ledger";
 pub const LEDGER_REF: &str = "refs/orkia/ledger/legacy";
 /// Append-only event namespace. Every event owns one immutable Git blob.
 pub const LEDGER_EVENT_REF_PREFIX: &str = "refs/orkia/ledger/events";
+/// Public actor keys used to verify ledger events after a fresh clone.
+pub const ACTOR_REF_PREFIX: &str = "refs/orkia/actors";
 pub const SEMANTIC_OBJECT_REF_PREFIX: &str = "refs/orkia/objects";
 pub const SEMANTIC_STATE_REF_PREFIX: &str = "refs/orkia/state";
 /// Binding from a human-facing view name to its immutable metadata object.
@@ -134,6 +136,48 @@ impl LibGit2Repository {
         GitLedgerStore {
             repository: self.clone(),
         }
+    }
+
+    /// Publishes the actor certificate needed to verify this repository's
+    /// ledger events after cloning. The event itself remains immutable and
+    /// signed; this ref is only the Git-native public-key registry.
+    pub fn store_actor(&self, actor: &Actor) -> Result<()> {
+        let repo = self.repo()?;
+        let reference = format!("{ACTOR_REF_PREFIX}/{}", actor.id.0);
+        let bytes = orkia_model::canonical_json(actor)?;
+        let object = repo.blob(&bytes).map_err(git_error)?;
+        match repo.find_reference(&reference) {
+            Ok(existing) if existing.target() == Some(object) => Ok(()),
+            Ok(_) => Err(OrkiaError::Integrity(format!(
+                "immutable actor ref {reference} already points to different content"
+            ))),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => repo
+                .reference(&reference, object, false, "Publish Orkia actor certificate")
+                .map(|_| ())
+                .map_err(git_error),
+            Err(error) => Err(git_error(error)),
+        }
+    }
+
+    /// Reconstructs the trusted actor registry from signed Git refs.
+    pub fn actors(&self) -> Result<BTreeMap<orkia_model::ActorId, Actor>> {
+        let repo = self.repo()?;
+        let mut actors = BTreeMap::new();
+        for reference in repo
+            .references_glob(&format!("{ACTOR_REF_PREFIX}/*"))
+            .map_err(git_error)?
+        {
+            let reference = reference.map_err(git_error)?;
+            let object = reference.peel(ObjectType::Blob).map_err(git_error)?;
+            let blob = object
+                .as_blob()
+                .ok_or_else(|| OrkiaError::Integrity("actor ref must point to a blob".into()))?;
+            let actor: Actor = serde_json::from_slice(blob.content()).map_err(|error| {
+                OrkiaError::Integrity(format!("invalid actor certificate: {error}"))
+            })?;
+            actors.insert(actor.id.clone(), actor);
+        }
+        Ok(actors)
     }
     pub fn semantic_store(&self) -> GitSemanticStore {
         GitSemanticStore {
@@ -4629,6 +4673,7 @@ mod tests {
         let source = LibGit2Repository::open(source_dir.path()).unwrap();
         let source_commit = source.head_commit().unwrap();
         let identity = Identity::generate("Ada");
+        source.store_actor(identity.actor()).unwrap();
         let policy = RepositoryPolicy::default();
         let state = source
             .materialize_semantic_state(&source_commit, &identity, &policy)
@@ -4704,6 +4749,10 @@ mod tests {
         assert_eq!(
             receiver.ledger_store().read_all().unwrap(),
             vec![ledger_event]
+        );
+        assert_eq!(
+            receiver.actors().unwrap().get(&identity.actor().id),
+            Some(identity.actor())
         );
         assert_eq!(
             receiver

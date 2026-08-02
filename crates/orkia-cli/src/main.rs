@@ -487,6 +487,13 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             let (actor, repository_id, identity_created) =
                 ensure_repository_initialized(&root, &secrets, name.as_deref())?;
+            let policy = load_repository_policy(&cli.repository)?;
+            git.store_actor(&actor)?;
+            let events = git.ledger_store().read_all()?;
+            let mut actors = git.actors()?;
+            actors.insert(actor.id.clone(), actor.clone());
+            verify_chain(&events, &actors)?;
+            let verified = git.verify_orkia_refs(&policy)?.verified_states;
             let executable = std::env::current_exe()
                 .map_err(|error| OrkiaError::External(format!("current executable: {error}")))?;
             let mut installed = Vec::new();
@@ -500,7 +507,7 @@ fn run(cli: Cli) -> Result<()> {
                 ));
             }
             println!(
-                "orkia initialized repository={} actor={} identity={} agents={} policy={} refs={} backend={}",
+                "orkia initialized repository={} actor={} identity={} agents={} ledger_events={} semantic_states={} policy={} refs={} backend={}",
                 repository_id.0,
                 actor.id.0,
                 if identity_created {
@@ -513,6 +520,8 @@ fn run(cli: Cli) -> Result<()> {
                 } else {
                     installed.join(",")
                 },
+                events.len(),
+                verified,
                 repository_policy_path(&root).display(),
                 root.join("refs/orkia/ledger").display(),
                 std::env::var("ORKIA_BACKEND_URL").unwrap_or_else(|_| "offline".into())
@@ -535,7 +544,8 @@ fn run(cli: Cli) -> Result<()> {
             LedgerCommand::Verify => {
                 let actor: Actor = read_json(&root.join("orkia/actor.json"))?;
                 let events = git.ledger_store().read_all()?;
-                let actors = BTreeMap::from([(actor.id.clone(), actor)]);
+                let mut actors = git.actors()?;
+                actors.insert(actor.id.clone(), actor);
                 verify_chain(&events, &actors)?;
                 println!("verified {} signed ledger events", events.len());
             }
@@ -2987,6 +2997,7 @@ fn open_ledger(
     let state = read_state(root)?;
     let identity = Identity::load(secrets, "identity", state.actor.clone())?
         .ok_or_else(|| OrkiaError::NotFound("Orkia identity".into()))?;
+    git.store_actor(identity.actor())?;
     Ok((
         state.clone(),
         Ledger::new(git.ledger_store(), SystemClock, state.repository, identity),
@@ -3005,6 +3016,7 @@ fn open_repository_ledger(
     let actor: Actor = read_json(&root.join("orkia/actor.json"))?;
     let identity = Identity::load(secrets, "identity", actor)?
         .ok_or_else(|| OrkiaError::NotFound("Orkia identity".into()))?;
+    git.store_actor(identity.actor())?;
     Ok(Ledger::new(
         git.ledger_store(),
         SystemClock,
@@ -3583,6 +3595,28 @@ mod tests {
         write_json(&root.join("orkia/actor.json"), identity.actor()).unwrap();
         write_json(&root.join("orkia/repository.json"), &RepositoryId::new()).unwrap();
         (repository, git, root, secrets, identity)
+    }
+
+    #[test]
+    fn init_is_idempotent_and_refuses_identity_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        git2::Repository::init(&repository).unwrap();
+        let git_root = git_dir(&repository).unwrap();
+        let secrets = FileSecrets {
+            root: git_root.join("orkia/keys"),
+        };
+        let (first_actor, first_repository, first_created) =
+            ensure_repository_initialized(&git_root, &secrets, Some("Phase 0")).unwrap();
+        assert!(first_created);
+        let key_before = fs::read(secrets.root.join("identity")).unwrap();
+        let (second_actor, second_repository, second_created) =
+            ensure_repository_initialized(&git_root, &secrets, Some("Phase 0")).unwrap();
+        assert!(!second_created);
+        assert_eq!(first_actor, second_actor);
+        assert_eq!(first_repository, second_repository);
+        assert_eq!(key_before, fs::read(secrets.root.join("identity")).unwrap());
+        assert!(ensure_repository_initialized(&git_root, &secrets, Some("replacement")).is_err());
     }
 
     #[test]

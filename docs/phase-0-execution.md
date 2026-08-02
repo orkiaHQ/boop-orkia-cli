@@ -24,7 +24,8 @@ Verified on 2026-08-01:
 
 - PostgreSQL is reachable on `127.0.0.1:5438` and NATS on `127.0.0.1:4223`.
 - Backend migrations apply cleanly and the server responds `204` to
-  `/health/live` and `/health/ready` on `127.0.0.1:18080`.
+  `/health/live` and `/health/ready` on `127.0.0.1:8080`; the worker process is
+  running alongside the server.
 - The GraphQL schema is served at `/graphql/schema` and unauthenticated
   requests return the expected `UNAUTHENTICATED` error.
 - The frontend builds with `npm ci` and `npm run build`; Vite serves the UI on
@@ -40,8 +41,16 @@ Verified on 2026-08-01:
 - The frontend now queries `repositoryCanonicalChangeSets` and renders a
   separate ledger-backed canonical ChangeSet card; detector output remains
   explicitly labeled as an evidence projection.
+- The Phase 0 operations view is data-driven: it displays the actual signed
+  proof count, signer, stack/dependency counts and backend validation state;
+  unavailable runtime projections are labeled as unavailable rather than
+  filled with sample records (frontend commit `d7a164a`).
 - `orkia init --create-git` creates a repository when needed, writes and
   validates a default `orkia.toml`, and reports the policy/ref/backend wiring.
+- `orkia init` publishes the Ed25519 actor certificate at
+  `refs/orkia/actors/<actor-id>` and verifies the complete ledger before it
+  reports success. This makes a fresh clone independently verifiable rather
+  than trusting a local key file.
 - CLI workspace tests pass (`15` tests) and the real CLI binary is built.
 - `scripts/e2e_server_changeset_status.sh` passes with a local service token:
   the HTTP server reconstructs a signed ChangeSet from Git refs and returns
@@ -87,6 +96,9 @@ plan, stack, projection, GitHub PR and ChangeSet automatically:
   automatic publication path and all required CI jobs passed;
 - publication authentication used the configured GitHub installation token;
   the local OAuth dashboard flow was also exercised against the running stack.
+- The backend registry is bound to the real `orkiaHQ` namespace and GitHub
+  repository IDs (`1319687696`, `1319687694`, `1319687699`), not the temporary
+  `riftrHQ` seed namespace.
 
 The exact proof is retained in `docs/phase0-cross-repo-e2e.md`. GitHub rejects
 arbitrary custom refs under `refs/orkia/*`; Orkia transports immutable signed
@@ -96,7 +108,9 @@ fetch. This remains ordinary Git object/ref transport.
 ## Clone reconstruction
 
 Three new clones (`*-reconstruct`) ran `orkia init` and
-`orkia ledger fetch --remote origin`. The coordinator then reconstructed
+`orkia ledger fetch --remote origin`. Each clone then independently ran
+`orkia ledger verify` successfully (`42`, `37` and `37` signed events); no
+source working tree or private signing key was copied. The coordinator then reconstructed
 ChangeSet `999f94b1-6885-52a5-b9a0-de715426d297`: `orkia changeset show` returned
 three stacks and `orkia changeset status` over the three clones returned
 `ready_for_integration: true`, with all three stack PRs published and a

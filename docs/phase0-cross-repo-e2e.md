@@ -31,12 +31,17 @@ curl -H 'authorization: Bearer phase0-service' \
 
 It returned revision `0`, status `active`, and a payload containing exactly
 three `stacks` and three signed `proofs`. GitHub checks for PRs #4, #6 and #7
-passed.
+passed. The local backend registry uses the real `orkiaHQ` namespace and
+GitHub repository IDs, so the authenticated UI renders the same organization
+and repository names rather than a fixture namespace.
 
 ## Reconstruction proof
 
 Fresh clones in `e2e/boop/*-reconstruct` ran `orkia init` and
-`orkia ledger fetch --remote origin`. The coordinator then ran:
+`orkia ledger fetch --remote origin`. `orkia init` fetched the public actor
+certificates from `refs/tags/orkia-meta/actors/*`, recreated the local
+`refs/orkia/actors/*` registry, and `orkia ledger verify` independently
+validated 42, 37 and 37 signed events. The coordinator then ran:
 
 ```sh
 orkia changeset show --id 999f94b1-6885-52a5-b9a0-de715426d297
