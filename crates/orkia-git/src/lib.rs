@@ -14,10 +14,10 @@ use git2::{
 };
 use orkia_identity::{Identity, verify};
 use orkia_model::{
-    AccessGrant, Attestation, ChangeSet, ChangeSetId, FileChange, GrantRevocation, GrantRole,
-    Intent, KeyRotation, LedgerEvent, Memory, MergeOutcome, MergeResolution, Organization,
-    OrkiaError, PlanId, Projection, ProjectionId, RepositoryPolicy, Result, ReviewPlan,
-    SemanticDocument, SemanticObjectKind, SemanticObjectRef, SemanticOperation,
+    AccessGrant, Actor, Attestation, ChangeSet, ChangeSetId, FileChange, GrantRevocation,
+    GrantRole, Intent, KeyRotation, LedgerEvent, Memory, MergeOutcome, MergeResolution,
+    Organization, OrkiaError, PlanId, Projection, ProjectionId, RepositoryPolicy, Result,
+    ReviewPlan, SemanticDocument, SemanticObjectKind, SemanticObjectRef, SemanticOperation,
     SemanticOperationAction, SemanticSignature, SemanticState, SessionId, Stack, StackId,
     StackPullRequest, StackPullRequestId, Team, TrunkState, VaultEntry, ViewMetadata,
     valid_vault_name,
@@ -41,6 +41,8 @@ pub const LEGACY_LEDGER_ROOT_REF: &str = "refs/orkia/ledger";
 pub const LEDGER_REF: &str = "refs/orkia/ledger/legacy";
 /// Append-only event namespace. Every event owns one immutable Git blob.
 pub const LEDGER_EVENT_REF_PREFIX: &str = "refs/orkia/ledger/events";
+/// Public actor keys used to verify ledger events after a fresh clone.
+pub const ACTOR_REF_PREFIX: &str = "refs/orkia/actors";
 pub const SEMANTIC_OBJECT_REF_PREFIX: &str = "refs/orkia/objects";
 pub const SEMANTIC_STATE_REF_PREFIX: &str = "refs/orkia/state";
 /// Binding from a human-facing view name to its immutable metadata object.
@@ -134,6 +136,48 @@ impl LibGit2Repository {
         GitLedgerStore {
             repository: self.clone(),
         }
+    }
+
+    /// Publishes the actor certificate needed to verify this repository's
+    /// ledger events after cloning. The event itself remains immutable and
+    /// signed; this ref is only the Git-native public-key registry.
+    pub fn store_actor(&self, actor: &Actor) -> Result<()> {
+        let repo = self.repo()?;
+        let reference = format!("{ACTOR_REF_PREFIX}/{}", actor.id.0);
+        let bytes = orkia_model::canonical_json(actor)?;
+        let object = repo.blob(&bytes).map_err(git_error)?;
+        match repo.find_reference(&reference) {
+            Ok(existing) if existing.target() == Some(object) => Ok(()),
+            Ok(_) => Err(OrkiaError::Integrity(format!(
+                "immutable actor ref {reference} already points to different content"
+            ))),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => repo
+                .reference(&reference, object, false, "Publish Orkia actor certificate")
+                .map(|_| ())
+                .map_err(git_error),
+            Err(error) => Err(git_error(error)),
+        }
+    }
+
+    /// Reconstructs the trusted actor registry from signed Git refs.
+    pub fn actors(&self) -> Result<BTreeMap<orkia_model::ActorId, Actor>> {
+        let repo = self.repo()?;
+        let mut actors = BTreeMap::new();
+        for reference in repo
+            .references_glob(&format!("{ACTOR_REF_PREFIX}/*"))
+            .map_err(git_error)?
+        {
+            let reference = reference.map_err(git_error)?;
+            let object = reference.peel(ObjectType::Blob).map_err(git_error)?;
+            let blob = object
+                .as_blob()
+                .ok_or_else(|| OrkiaError::Integrity("actor ref must point to a blob".into()))?;
+            let actor: Actor = serde_json::from_slice(blob.content()).map_err(|error| {
+                OrkiaError::Integrity(format!("invalid actor certificate: {error}"))
+            })?;
+            actors.insert(actor.id.clone(), actor);
+        }
+        Ok(actors)
     }
     pub fn semantic_store(&self) -> GitSemanticStore {
         GitSemanticStore {
@@ -1408,7 +1452,20 @@ impl LibGit2Repository {
     /// second synchronization protocol.
     pub fn push_orkia_refs(&self, remote: &str) -> Result<()> {
         let repo = self.repo()?;
-        let refspecs = local_orkia_refspecs(&repo)?;
+        let refspecs = local_orkia_refspecs(&repo)?
+            .into_iter()
+            .map(|local| {
+                let suffix = local
+                    .strip_prefix("refs/orkia/")
+                    .ok_or_else(|| OrkiaError::Integrity("invalid Orkia ref namespace".into()))?;
+                // GitHub accepts tag namespaces but rejects arbitrary
+                // top-level refs and branch refs that point at blob objects.
+                // Lightweight tags can point at every Git object type Orkia
+                // stores, so mirror the canonical local namespace through a
+                // forge-neutral tag transport namespace.
+                Ok(format!("{local}:refs/tags/orkia-meta/{suffix}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         if refspecs.is_empty() {
             return Ok(());
         }
@@ -1425,23 +1482,50 @@ impl LibGit2Repository {
         let repo = self.repo()?;
         let mut remote = repo.find_remote(remote).map_err(git_error)?;
         remote.connect(git2::Direction::Fetch).map_err(git_error)?;
-        let refspecs = remote
+        let advertised: Vec<_> = remote
             .list()
             .map_err(git_error)?
             .iter()
-            .map(|head| head.name())
-            .filter(|name| name.starts_with(ORKIA_REF_PREFIX))
-            // Every Orkia revision ref is immutable. A later revision gets a
-            // new path, so forcing an update here would let a remote replace
-            // a local signed decision before signature verification runs.
-            .map(|name| format!("{name}:{name}"))
+            .map(|head| (head.name().to_owned(), head.oid()))
+            .collect();
+        let sources: Vec<_> = advertised
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .filter(|name| {
+                name.starts_with(ORKIA_REF_PREFIX) || name.starts_with("refs/tags/orkia-meta/")
+            })
             .collect::<Vec<_>>();
         remote.disconnect().map_err(git_error)?;
-        if refspecs.is_empty() {
+        if sources.is_empty() {
             return Ok(());
         }
-        let refspecs: Vec<_> = refspecs.iter().map(String::as_str).collect();
-        remote.fetch(&refspecs, None, None).map_err(git_error)
+        // Download the advertised objects, then materialize local refs
+        // explicitly. This supports lightweight tag transport even when the
+        // referenced object is a blob or tree (libgit2's fetch refspec
+        // update path only updates commit-like refs in some versions).
+        remote.connect(git2::Direction::Fetch).map_err(git_error)?;
+        remote.download(&sources, None).map_err(git_error)?;
+        remote.disconnect().map_err(git_error)?;
+        for (name, oid) in advertised {
+            let destination = if let Some(suffix) = name.strip_prefix("refs/tags/orkia-meta/") {
+                format!("refs/orkia/{suffix}")
+            } else if name.starts_with(ORKIA_REF_PREFIX) {
+                name
+            } else {
+                continue;
+            };
+            if repo
+                .find_reference(&destination)
+                .ok()
+                .and_then(|reference| reference.target())
+                == Some(oid)
+            {
+                continue;
+            }
+            repo.reference(&destination, oid, true, "Orkia semantic ref fetch")
+                .map_err(git_error)?;
+        }
+        Ok(())
     }
 
     /// Fetches Orkia refs through Git, then validates every fetched semantic
@@ -1916,16 +2000,26 @@ fn resolve_token_conflicts(repo: &Repository, index: &mut git2::Index) -> Result
 }
 
 fn local_orkia_refspecs(repo: &Repository) -> Result<Vec<String>> {
-    let references = repo.references_glob("refs/orkia/*").map_err(git_error)?;
-    references
-        .map(|reference| {
-            let reference = reference.map_err(git_error)?;
-            let name = reference.name().ok_or_else(|| {
-                OrkiaError::Integrity("an Orkia reference has no UTF-8 name".into())
-            })?;
-            Ok(format!("{name}:{name}"))
-        })
-        .collect()
+    // `references_glob("refs/orkia/*")` only matches one ref segment with
+    // libgit2. Orkia revisions live several segments below that namespace
+    // (`changesets/<id>/<revision>`, `stacks/<id>/<revision>`, ...), so a
+    // recursive walk is required to make clone reconstruction actually
+    // transport every signed object and ledger ref.
+    let mut names = Vec::new();
+    for reference in repo.references().map_err(git_error)? {
+        let reference = reference.map_err(git_error)?;
+        let Some(name) = reference.name() else {
+            return Err(OrkiaError::Integrity(
+                "an Orkia reference has no UTF-8 name".into(),
+            ));
+        };
+        if name.starts_with("refs/orkia/") {
+            names.push(name.to_owned());
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 fn view_ref_name(name: &str) -> Result<String> {
@@ -3094,6 +3188,39 @@ impl GitSemanticStore {
         Ok(latest)
     }
 
+    /// Reconstructs the newest signed revision of every Stack identity in
+    /// this repository.  This is intentionally derived from refs rather than
+    /// a local cache so a coordinator can discover repository-local stacks
+    /// after cloning or fetching a repository.
+    pub fn latest_stacks(&self, policy: &RepositoryPolicy) -> Result<Vec<Stack>> {
+        let repo = self.repository.repo()?;
+        let mut latest = BTreeMap::<StackId, Stack>::new();
+        for reference in repo
+            .references_glob(&format!("{ORKIA_REF_PREFIX}stacks/*/*"))
+            .map_err(git_error)?
+        {
+            let reference = reference.map_err(git_error)?;
+            let target = reference
+                .target()
+                .ok_or_else(|| OrkiaError::Integrity("stack ref must not be symbolic".into()))?;
+            let object = SemanticObjectRef {
+                kind: SemanticObjectKind::Stack,
+                hash: target.to_string(),
+            };
+            self.require_signature_quorum(&object, policy)?;
+            let stack = self.get_stack(&object)?;
+            latest
+                .entry(stack.id.clone())
+                .and_modify(|current| {
+                    if stack.revision > current.revision {
+                        *current = stack.clone();
+                    }
+                })
+                .or_insert(stack);
+        }
+        Ok(latest.into_values().collect())
+    }
+
     /// Loads one exact signed Stack revision. ChangeSets use this rather than
     /// a latest lookup so their historical delivery decision is immutable even
     /// after the referenced stack has been restacked.
@@ -3141,6 +3268,29 @@ impl GitSemanticStore {
         )
     }
 
+    fn verify_stack_pull_request_intent(
+        &self,
+        pull_request: &StackPullRequest,
+        policy: &RepositoryPolicy,
+    ) -> Result<()> {
+        let Some(intent) = &pull_request.intent else {
+            return Ok(());
+        };
+        if intent.kind != SemanticObjectKind::Intent {
+            return Err(OrkiaError::Integrity(
+                "stack pull request intent ref has the wrong semantic kind".into(),
+            ));
+        }
+        self.require_signature_quorum(intent, policy)?;
+        let stored = self.get_intent(intent)?;
+        if stored.session.as_ref() != Some(&pull_request.session) {
+            return Err(OrkiaError::Integrity(
+                "stack pull request intent is bound to a different session".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns the newest signed revision of every StackPullRequest derived from one
     /// review plan. This is a Git-ref reconstruction, never a local cache.
     pub fn stack_pull_requests_for_plan(
@@ -3164,6 +3314,7 @@ impl GitSemanticStore {
             };
             self.require_signature_quorum(&object, policy)?;
             let pull_request = self.get_stack_pull_request(&object)?;
+            self.verify_stack_pull_request_intent(&pull_request, policy)?;
             if pull_request.source_plan.as_ref() != Some(&plan.id)
                 || pull_request.source_plan_revision != plan.revision
             {
@@ -3207,6 +3358,7 @@ impl GitSemanticStore {
             };
             self.require_signature_quorum(&object, policy)?;
             let pull_request = self.get_stack_pull_request(&object)?;
+            self.verify_stack_pull_request_intent(&pull_request, policy)?;
             if pull_request.id != *id {
                 return Err(OrkiaError::Integrity(format!(
                     "stack pull request ref under {} points to stack pull request {}",
@@ -3246,6 +3398,7 @@ impl GitSemanticStore {
         };
         self.require_signature_quorum(&object, policy)?;
         let pull_request = self.get_stack_pull_request(&object)?;
+        self.verify_stack_pull_request_intent(&pull_request, policy)?;
         if pull_request.id != *id || pull_request.revision != revision {
             return Err(OrkiaError::Integrity(format!(
                 "stack pull request ref under {}/{} points to stack pull request {} revision {}",
@@ -4546,6 +4699,7 @@ mod tests {
         let source = LibGit2Repository::open(source_dir.path()).unwrap();
         let source_commit = source.head_commit().unwrap();
         let identity = Identity::generate("Ada");
+        source.store_actor(identity.actor()).unwrap();
         let policy = RepositoryPolicy::default();
         let state = source
             .materialize_semantic_state(&source_commit, &identity, &policy)
@@ -4621,6 +4775,10 @@ mod tests {
         assert_eq!(
             receiver.ledger_store().read_all().unwrap(),
             vec![ledger_event]
+        );
+        assert_eq!(
+            receiver.actors().unwrap().get(&identity.actor().id),
+            Some(identity.actor())
         );
         assert_eq!(
             receiver

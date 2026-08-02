@@ -1523,7 +1523,12 @@ impl Default for RepositoryPolicy {
     fn default() -> Self {
         Self {
             protected_branches: BTreeSet::from(["main".into()]),
-            validation_commands: Vec::new(),
+            // Every automatic checkpoint must leave an explicit, deterministic
+            // validation record in the causal ledger.  Repositories can add
+            // stronger commands in `orkia.toml`; this Git-native check is the
+            // safe baseline that works for every language and does not require
+            // a toolchain to be installed.
+            validation_commands: vec!["git diff --check".into()],
             minimum_coverage_milli: 950,
             minimum_confidence_milli: 800,
             required_approvals: 1,

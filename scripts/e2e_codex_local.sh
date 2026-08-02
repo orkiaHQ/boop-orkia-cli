@@ -39,6 +39,12 @@ base_commit=$(git -C "$test_root" rev-parse main)
 plan_id=$(git -C "$test_root" for-each-ref --format='%(refname)' refs/orkia/plans \
   | sed -E 's#refs/orkia/plans/([^/]+)/.*#\1#' | sort -u | head -n 1)
 test -n "$plan_id"
+stack_pr_ref=$(git -C "$test_root" for-each-ref --format='%(refname)' refs/orkia/stack-prs \
+  | sort | head -n 1)
+test -n "$stack_pr_ref"
+stack_pr_object=$(git -C "$test_root" rev-parse "$stack_pr_ref")
+git -C "$test_root" cat-file blob "$stack_pr_object" \
+  | python3 -c 'import json, sys; value=json.load(sys.stdin); validations=value.get("validations", []); assert any(item.get("command") == "git diff --check" and item.get("passed") for item in validations), value'
 "$orkia_bin" --repository "$test_root" review project --plan "$plan_id"
 "$orkia_bin" --repository "$test_root" ledger verify
 
