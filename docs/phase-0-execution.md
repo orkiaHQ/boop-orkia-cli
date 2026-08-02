@@ -28,6 +28,10 @@ Verified on 2026-08-01:
   requests return the expected `UNAUTHENTICATED` error.
 - The frontend builds with `npm ci` and `npm run build`; Vite serves the UI on
   `127.0.0.1:14173` with the backend endpoint configured.
+- The frontend Project Operations view now queries and renders the backend's
+  repository ChangeSet detection projection (`repositoryChangeSets`). The
+  view labels it as evidence and does not present it as the canonical signed
+  multi-repository ChangeSet; the UI change is merged in frontend `6e85d84`.
 - CLI workspace tests pass (`15` tests) and the real CLI binary is built.
 - `scripts/e2e_server_changeset_status.sh` passes with a local service token:
   the HTTP server reconstructs a signed ChangeSet from Git refs and returns
