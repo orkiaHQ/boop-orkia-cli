@@ -26,6 +26,9 @@ Verified on 2026-08-01:
 - Backend migrations apply cleanly and the server responds `204` to
   `/health/live` and `/health/ready` on `127.0.0.1:8080`; the worker process is
   running alongside the server.
+- `GET /version` publishes the running API package version and
+  `changeset_wire_version: 1`; the signed CLI envelope carries the same wire
+  contract.
 - The GraphQL schema is served at `/graphql/schema` and unauthenticated
   requests return the expected `UNAUTHENTICATED` error.
 - The frontend builds with `npm ci` and `npm run build`; Vite serves the UI on
@@ -53,7 +56,11 @@ Verified on 2026-08-01:
   `refs/orkia/actors/<actor-id>` and verifies the complete ledger before it
   reports success. This makes a fresh clone independently verifiable rather
   than trusting a local key file.
-- CLI workspace tests pass (`15` tests) and the real CLI binary is built.
+- CLI workspace tests and Clippy pass; the real CLI binary is built. Automatic
+  checkpoints run the deterministic default validation `git diff --check` (or
+  the repository's configured commands), store each result in every
+  `StackPullRequest`, and append the signed `Validation` event before
+  projection.
 - `scripts/e2e_server_changeset_status.sh` passes with a local service token:
   the HTTP server reconstructs a signed ChangeSet from Git refs and returns
   its execution order with `ready_for_integration: false` until projection.
@@ -71,6 +78,10 @@ Evidence from that clone:
 - `orkia review plan`: one atom, one review unit, coverage `1000‰`;
 - signed `refs/orkia/plans/*`, `refs/orkia/stacks/*` and
   `refs/orkia/stack-prs/*` were created;
+- the first captured provider prompt was materialized as a signed Intent,
+  linked from the StackPullRequest and retained under `refs/orkia/intents/*`;
+- each generated StackPullRequest contains the passing `git diff --check`
+  validation, and the same result is present as a signed ledger event;
 - the absolute file path emitted by Codex is correlated with Git's relative
   path by the regression-tested path normalizer.
 
@@ -81,6 +92,11 @@ of the frontend and CLI repositories. Their evidence is:
   `orkia review plan` reported one atom, one unit, coverage `1000‰`;
 - CLI: `orkia ledger verify` reported `19` signed events and
   `orkia review plan` reported one atom, one unit, coverage `1000‰`.
+
+The reproducible no-manual-session harness is
+`scripts/e2e_codex_automatic.sh`. Its live run created a signed Intent, plan,
+StackPullRequest, Stack and ChangeSet from Codex hooks alone and asserted the
+persisted passing validation.
 
 ## Automatic cross-repository publication
 

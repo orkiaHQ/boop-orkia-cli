@@ -13,10 +13,10 @@ use orkia_github::{GitHubApp, GitHubAppCredentials};
 use orkia_identity::Identity;
 use orkia_ledger::{Ledger, SystemClock, verify_chain};
 use orkia_model::{
-    Actor, AgentSnapshotPhase, CaptureEvent, CaptureOrigin, ChangeSetId, ChangeSetStack,
+    Actor, AgentSnapshotPhase, CaptureEvent, CaptureOrigin, ChangeSetId, ChangeSetStack, Intent,
     OrkiaError, RepositoryId, RepositoryPolicy, Result, ReviewPlan, SessionId, StackId,
 };
-use orkia_ports::{Forge, GitRepository, LedgerStore, SecretStore};
+use orkia_ports::{Forge, GitRepository, LedgerStore, SecretStore, SemanticDocumentStore};
 use orkia_review::{PlanningInput, plan};
 use orkia_semantic::{
     ChangedFile, changed_line_ranges, extract_atoms_in_ranges, infer_dependencies,
@@ -2544,6 +2544,58 @@ fn derive_review_plan(
     })))
 }
 
+/// Materializes the provider's first captured prompt as a signed semantic
+/// Intent. SessionStarted is intentionally only a fallback: provider prompts
+/// are the authoritative user intent and are what the automatic ChangeSet
+/// coordinator correlates across repositories.
+fn automatic_intent(
+    git: &LibGit2Repository,
+    identity: &Identity,
+    events: &[orkia_model::LedgerEvent],
+    session: &SessionId,
+) -> Result<orkia_model::SemanticObjectRef> {
+    let scoped = session_events(events, session)?;
+    let body = scoped
+        .iter()
+        .find_map(|event| match &event.unsigned.event {
+            CaptureEvent::AgentAction {
+                session: Some(recorded),
+                action: orkia_model::AgentActionKind::Prompt { content },
+                ..
+            } if recorded == session && !content.trim().is_empty() => Some(content.trim()),
+            _ => None,
+        })
+        .or_else(|| {
+            scoped.iter().find_map(|event| match &event.unsigned.event {
+                CaptureEvent::SessionStarted {
+                    session: recorded,
+                    objective,
+                    ..
+                } if recorded == session && !objective.trim().is_empty() => Some(objective.trim()),
+                _ => None,
+            })
+        })
+        .ok_or_else(|| OrkiaError::Invalid("automatic review has no captured intent".into()))?;
+    let title = body
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Captured work")
+        .chars()
+        .take(120)
+        .collect::<String>();
+    let intent = Intent {
+        schema_version: orkia_model::SEMANTIC_SCHEMA_VERSION,
+        title,
+        body: body.to_owned(),
+        session: Some(session.clone()),
+        evidence: BTreeSet::new(),
+    };
+    let object = git.semantic_store().put_intent(&intent)?;
+    git.semantic_store().sign_document(&object, identity)?;
+    Ok(object)
+}
+
 // This is the CLI composition boundary. It deliberately carries the complete
 // capture context needed to atomically publish the derived semantic objects.
 #[allow(clippy::too_many_arguments)]
@@ -2588,6 +2640,8 @@ fn persist_review_plan(
         Err(error) => return Err(error),
     }
     git.semantic_store().store_review_plan(plan, &identity)?;
+    let events = git.ledger_store().read_all()?;
+    let intent = automatic_intent(git, &identity, &events, session)?;
     // Automatic publication is itself a review checkpoint.  Capture the
     // policy validations before deriving StackPullRequests so every durable
     // unit carries the exact validation results that were available when it
@@ -2600,6 +2654,7 @@ fn persist_review_plan(
         base_commit.into(),
     )?;
     for pull_request in &mut pull_requests {
+        pull_request.intent = Some(intent.clone());
         pull_request.validations = validations.clone();
         orkia_projection::bind_patches(pull_request, changes)?;
         if let Some((previous, current)) = git
@@ -3693,6 +3748,13 @@ mod tests {
             vec!["git diff --check"],
             "automatic StackPullRequests retain the checkpoint validation"
         );
+        let intent_ref = pull_requests[0]
+            .intent
+            .clone()
+            .expect("automatic StackPullRequests retain a signed intent");
+        let intent = git.semantic_store().get_intent(&intent_ref).unwrap();
+        assert!(intent.session.is_some());
+        assert_eq!(intent.body, "add a feature");
         assert!(git.ledger_store().read_all().unwrap().iter().any(|event| {
             matches!(
                 event.unsigned.event,
