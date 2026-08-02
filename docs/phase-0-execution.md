@@ -1,7 +1,7 @@
 # Phase 0 execution record
 
-Status: in progress. This record is evidence, not a declaration that the
-phase is complete.
+Status: implementation complete for the local vertical slice. GitHub OAuth and
+real PR publication remain external acceptance gates.
 
 ## Repositories
 
@@ -32,6 +32,15 @@ Verified on 2026-08-01:
   repository ChangeSet detection projection (`repositoryChangeSets`). The
   view labels it as evidence and does not present it as the canonical signed
   multi-repository ChangeSet; the UI change is merged in frontend `6e85d84`.
+- The backend now stores verified signed ChangeSet envelopes in the immutable
+  `canonical_changesets` table, keyed by `(changeset_id, revision)` and
+  deduplicated by payload hash. CLI checkpoints and automatic agent Stop hooks
+  submit the exact Ed25519-covered payload when `ORKIA_BACKEND_URL` is set.
+- The frontend now queries `repositoryCanonicalChangeSets` and renders a
+  separate ledger-backed canonical ChangeSet card; detector output remains
+  explicitly labeled as an evidence projection.
+- `orkia init --create-git` creates a repository when needed, writes and
+  validates a default `orkia.toml`, and reports the policy/ref/backend wiring.
 - CLI workspace tests pass (`15` tests) and the real CLI binary is built.
 - `scripts/e2e_server_changeset_status.sh` passes with a local service token:
   the HTTP server reconstructs a signed ChangeSet from Git refs and returns
@@ -63,8 +72,14 @@ of the frontend and CLI repositories. Their evidence is:
 
 ## Remaining Phase 0 gates
 
-The authenticated backend ingestion of a signed CLI envelope, cross-repository
-ChangeSet submission, GitHub PR projection, and frontend rendering of the
-real ChangeSet still need to be exercised. OAuth is currently configured with
-local dummy credentials, so a real GitHub login must be wired before that E2E
-gate can be marked complete.
+The signed CLI envelope path is exercised against the local backend and is
+idempotent (`idempotent: true` on replay, one database row). Three seeded local
+fixtures mapped to the real public GitHub repositories
+`boop-orkia-backend`, `boop-orkia-frontend`, and `boop-orkia-cli` each produced
+an automatic signed plan, stack, and ChangeSet; their canonical rows are
+visible in Postgres and via `/api/v1/changesets/{id}`.
+
+The remaining acceptance gates require a real authenticated browser session:
+GitHub OAuth, projection of those ChangeSets into real GitHub PRs/checks, and a
+browser assertion of the canonical frontend card. Local credentials are
+configured for the server, but no browser login was performed in this run.

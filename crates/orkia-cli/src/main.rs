@@ -1,5 +1,6 @@
 //! Terminal composition root for Orkia.
 
+use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
 use clap::{Parser, Subcommand, ValueEnum};
 use orkia_agents::{
     Agent as SupportedAgent, TranscriptReconciliation, all_statuses, install as install_agent,
@@ -13,7 +14,7 @@ use orkia_identity::Identity;
 use orkia_ledger::{Ledger, SystemClock, verify_chain};
 use orkia_model::{
     Actor, AgentSnapshotPhase, CaptureEvent, CaptureOrigin, ChangeSetId, ChangeSetStack,
-    OrkiaError, RepositoryId, Result, ReviewPlan, SessionId, StackId,
+    OrkiaError, RepositoryId, RepositoryPolicy, Result, ReviewPlan, SessionId, StackId,
 };
 use orkia_ports::{Forge, GitRepository, LedgerStore, SecretStore};
 use orkia_review::{PlanningInput, plan};
@@ -40,6 +41,9 @@ enum Command {
         /// Display name used only when creating a new local identity.
         #[arg(long)]
         name: Option<String>,
+        /// Create the Git repository when the target directory is not already a repository.
+        #[arg(long)]
+        create_git: bool,
         /// Install measured provider hooks as part of repository bootstrap.
         #[arg(long = "agent")]
         agent: Vec<String>,
@@ -298,6 +302,50 @@ struct ChangeSetExecutionStep {
     revision: u32,
     published: bool,
 }
+
+#[derive(Serialize)]
+struct WireChangeSetStack {
+    repository_id: RepositoryId,
+    stack_id: StackId,
+    revision: u32,
+}
+
+#[derive(Serialize)]
+struct WireChangeSetProof {
+    repository_id: RepositoryId,
+    stack_id: StackId,
+    revision: u32,
+    refs: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct WireChangeSetPayload {
+    wire_version: u16,
+    signer_id: uuid::Uuid,
+    changeset_id: ChangeSetId,
+    revision: u32,
+    coordinator_repository_id: RepositoryId,
+    status: String,
+    stacks: Vec<WireChangeSetStack>,
+    depends_on: Vec<ChangeSetId>,
+    proofs: Vec<WireChangeSetProof>,
+}
+
+#[derive(Serialize)]
+struct WireChangeSetSigner {
+    id: uuid::Uuid,
+    display_name: String,
+    public_key: String,
+}
+
+#[derive(Serialize)]
+struct WireChangeSetSubmission {
+    wire_version: u16,
+    submission_id: uuid::Uuid,
+    signer: WireChangeSetSigner,
+    payload_base64: String,
+    signature: String,
+}
 #[derive(Clone)]
 struct FileSecrets {
     root: PathBuf,
@@ -394,7 +442,19 @@ fn run(cli: Cli) -> Result<()> {
     {
         return run_agent_hook(agent, &cli.repository);
     }
-    let git = LibGit2Repository::open(&cli.repository)?;
+    let git = match &cli.command {
+        Command::Init {
+            create_git: true, ..
+        } => match LibGit2Repository::open(&cli.repository) {
+            Ok(git) => git,
+            Err(_) => {
+                git2::Repository::init(&cli.repository)
+                    .map_err(|e| OrkiaError::External(format!("create Git repository: {e}")))?;
+                LibGit2Repository::open(&cli.repository)?
+            }
+        },
+        _ => LibGit2Repository::open(&cli.repository)?,
+    };
     let root = git_dir(&cli.repository)?;
     let secrets = FileSecrets {
         root: root.join("orkia/keys"),
@@ -402,7 +462,11 @@ fn run(cli: Cli) -> Result<()> {
     fs::create_dir_all(root.join("orkia/plans"))
         .map_err(|e| OrkiaError::External(e.to_string()))?;
     match cli.command {
-        Command::Init { name, agent } => {
+        Command::Init {
+            name,
+            create_git: _,
+            agent,
+        } => {
             let (actor, repository_id, identity_created) =
                 ensure_repository_initialized(&root, &secrets, name.as_deref())?;
             let executable = std::env::current_exe()
@@ -418,7 +482,7 @@ fn run(cli: Cli) -> Result<()> {
                 ));
             }
             println!(
-                "orkia initialized repository={} actor={} identity={} agents={}",
+                "orkia initialized repository={} actor={} identity={} agents={} policy={} refs={} backend={}",
                 repository_id.0,
                 actor.id.0,
                 if identity_created {
@@ -430,7 +494,10 @@ fn run(cli: Cli) -> Result<()> {
                     "none".to_owned()
                 } else {
                     installed.join(",")
-                }
+                },
+                repository_policy_path(&root).display(),
+                root.join("refs/orkia/ledger").display(),
+                std::env::var("ORKIA_BACKEND_URL").unwrap_or_else(|_| "offline".into())
             );
         }
         Command::Identity {
@@ -933,11 +1000,7 @@ fn record_agent_snapshot(
 ) -> Result<orkia_model::LedgerEvent> {
     let events = git.ledger_store().read_all()?;
     let base_commit = session_base(&events, session)?;
-    let changed_paths = git
-        .changes_since(&base_commit)?
-        .into_iter()
-        .map(|change| change.path)
-        .collect::<BTreeSet<_>>();
+    let changed_paths = changed_paths(git, &base_commit)?;
     let observed_paths = observed_agent_paths(&events, session, repository);
     let unknown_write = changed_paths.iter().any(|path| {
         !observed_paths
@@ -1635,6 +1698,7 @@ fn handle_changeset(
                 revision: change_set.revision,
                 object,
             })?;
+            maybe_submit_changeset(&change_set, &identity)?;
             println!(
                 "changeset {} revision {} published",
                 change_set.id.0, change_set.revision
@@ -2151,7 +2215,11 @@ fn derive_review_plan(
     checkpoint: String,
 ) -> Result<Option<ReviewPlan>> {
     let policy_digest = orkia_model::repository_policy_digest(policy)?;
-    let changes = git.changes_since(base_commit)?;
+    let changes = git
+        .changes_since(base_commit)?
+        .into_iter()
+        .filter(|change| !is_orkia_owned_path(&change.path))
+        .collect::<Vec<_>>();
     let scoped_events = session_events(events, session)?;
     let source_events = scoped_events
         .iter()
@@ -2307,7 +2375,7 @@ fn persist_review_plan(
         .semantic_store()
         .store_changeset(&change_set, &identity)?;
     ledger.append(CaptureEvent::ChangeSetPublished {
-        changeset: change_set.id,
+        changeset: change_set.id.clone(),
         revision: change_set.revision,
         object,
     })?;
@@ -2317,6 +2385,92 @@ fn persist_review_plan(
         atom_count: plan.atoms.len() as u32,
         coverage_milli: plan.coverage_milli,
     })?;
+    maybe_submit_changeset(&change_set, &identity)?;
+    Ok(())
+}
+
+/// Submit the signed, content-free ChangeSet envelope when a backend is
+/// configured. Offline repositories remain fully functional; publication is
+/// retried by the same deterministic payload on the next checkpoint.
+fn maybe_submit_changeset(change_set: &orkia_model::ChangeSet, identity: &Identity) -> Result<()> {
+    let Some(base_url) = std::env::var_os("ORKIA_BACKEND_URL") else {
+        return Ok(());
+    };
+    let base_url = base_url.to_string_lossy().trim_end_matches('/').to_owned();
+    let stacks = change_set
+        .stacks
+        .iter()
+        .map(|stack| WireChangeSetStack {
+            repository_id: stack.repository.clone(),
+            stack_id: stack.stack.clone(),
+            revision: stack.revision,
+        })
+        .collect::<Vec<_>>();
+    let proofs = stacks
+        .iter()
+        .map(|stack| WireChangeSetProof {
+            repository_id: stack.repository_id.clone(),
+            stack_id: stack.stack_id.clone(),
+            revision: stack.revision,
+            refs: vec![
+                format!("refs/orkia/stacks/{}/{}", stack.stack_id.0, stack.revision),
+                format!(
+                    "refs/orkia/changesets/{}/{}",
+                    change_set.id.0, change_set.revision
+                ),
+            ],
+        })
+        .collect::<Vec<_>>();
+    let payload = WireChangeSetPayload {
+        wire_version: 1,
+        signer_id: identity.actor().id.0,
+        changeset_id: change_set.id.clone(),
+        revision: change_set.revision,
+        coordinator_repository_id: stacks
+            .first()
+            .map(|stack| stack.repository_id.clone())
+            .ok_or_else(|| OrkiaError::Invalid("ChangeSet has no stacks".into()))?,
+        status: format!("{:?}", change_set.status).to_lowercase(),
+        stacks,
+        depends_on: change_set.depends_on.iter().cloned().collect(),
+        proofs,
+    };
+    let payload_bytes = serde_json::to_vec(&payload).map_err(|error| {
+        OrkiaError::Invalid(format!("serialize ChangeSet wire payload: {error}"))
+    })?;
+    let envelope = WireChangeSetSubmission {
+        wire_version: 1,
+        submission_id: uuid::Uuid::new_v4(),
+        signer: WireChangeSetSigner {
+            id: identity.actor().id.0,
+            display_name: identity.actor().display_name.clone(),
+            public_key: identity.actor().public_key.clone(),
+        },
+        payload_base64: STANDARD_NO_PAD.encode(&payload_bytes),
+        signature: identity.sign(&payload_bytes),
+    };
+    let client = reqwest::blocking::Client::new();
+    let mut request = client.post(format!("{base_url}/api/v1/changesets"));
+    if let Some(token) =
+        std::env::var_os("ORKIA_BACKEND_TOKEN").or_else(|| std::env::var_os("ORKIA_SERVICE_TOKEN"))
+    {
+        request = request.bearer_auth(token.to_string_lossy());
+    }
+    let response = request
+        .json(&envelope)
+        .send()
+        .map_err(|error| OrkiaError::External(format!("ChangeSet backend submission: {error}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().unwrap_or_default();
+        return Err(OrkiaError::External(format!(
+            "ChangeSet backend submission returned {status}: {detail}"
+        )));
+    }
+    eprintln!(
+        "ChangeSet {} revision {} submitted to backend",
+        change_set.id.0, change_set.revision
+    );
     Ok(())
 }
 
@@ -2508,7 +2662,15 @@ fn changed_paths(git: &LibGit2Repository, base: &str) -> Result<BTreeSet<String>
         .changes_since(base)?
         .into_iter()
         .map(|change| change.path)
+        .filter(|path| !is_orkia_owned_path(path))
         .collect())
+}
+
+fn is_orkia_owned_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized == "orkia.toml"
+        || normalized.starts_with(".orkia/")
+        || normalized.starts_with("orkia/")
 }
 fn record_known_changes(
     git: &LibGit2Repository,
@@ -2767,7 +2929,26 @@ fn ensure_repository_initialized(
     };
     fs::create_dir_all(root.join("orkia/plans"))
         .map_err(|error| OrkiaError::External(error.to_string()))?;
+    let policy_path = repository_policy_path(root);
+    if !policy_path.exists() {
+        let policy = toml::to_string_pretty(&RepositoryPolicy::default())
+            .map_err(|error| OrkiaError::Invalid(format!("serialize default policy: {error}")))?;
+        fs::write(&policy_path, policy).map_err(|error| {
+            OrkiaError::External(format!("write {}: {error}", policy_path.display()))
+        })?;
+    } else {
+        let policy = fs::read_to_string(&policy_path).map_err(|error| {
+            OrkiaError::External(format!("read {}: {error}", policy_path.display()))
+        })?;
+        toml::from_str::<RepositoryPolicy>(&policy).map_err(|error| {
+            OrkiaError::Invalid(format!("invalid {}: {error}", policy_path.display()))
+        })?;
+    }
     Ok((actor, repository_id, identity_created))
+}
+
+fn repository_policy_path(git_dir: &Path) -> PathBuf {
+    git_dir.parent().unwrap_or(git_dir).join("orkia.toml")
 }
 fn read_state(root: &Path) -> Result<SessionState> {
     read_json(&root.join("orkia/session.json"))
@@ -2910,6 +3091,14 @@ mod tests {
         assert_eq!(parsed, repository);
         assert_eq!(path, PathBuf::from("/tmp/orkia-stack"));
         assert!(parse_changeset_repository_path(&format!("{}=relative", repository.0)).is_err());
+    }
+
+    #[test]
+    fn excludes_orkia_owned_metadata_from_causal_changes() {
+        assert!(is_orkia_owned_path("orkia.toml"));
+        assert!(is_orkia_owned_path("orkia/plans/example.json"));
+        assert!(is_orkia_owned_path(".orkia/cache"));
+        assert!(!is_orkia_owned_path("src/lib.rs"));
     }
 
     #[test]
