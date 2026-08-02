@@ -3282,7 +3282,10 @@ fn run_validations(
     let mut results = Vec::new();
     for command in &policy.validation_commands {
         let output = std::process::Command::new("sh")
-            .arg("-lc")
+            // Validation commands must not source an interactive/login shell:
+            // that would make signed results depend on a user's profile and
+            // can add unrelated diagnostics to an otherwise passing check.
+            .arg("-c")
             .arg(command)
             .current_dir(repository)
             .output()
