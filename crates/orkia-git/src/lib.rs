@@ -3268,6 +3268,29 @@ impl GitSemanticStore {
         )
     }
 
+    fn verify_stack_pull_request_intent(
+        &self,
+        pull_request: &StackPullRequest,
+        policy: &RepositoryPolicy,
+    ) -> Result<()> {
+        let Some(intent) = &pull_request.intent else {
+            return Ok(());
+        };
+        if intent.kind != SemanticObjectKind::Intent {
+            return Err(OrkiaError::Integrity(
+                "stack pull request intent ref has the wrong semantic kind".into(),
+            ));
+        }
+        self.require_signature_quorum(intent, policy)?;
+        let stored = self.get_intent(intent)?;
+        if stored.session.as_ref() != Some(&pull_request.session) {
+            return Err(OrkiaError::Integrity(
+                "stack pull request intent is bound to a different session".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns the newest signed revision of every StackPullRequest derived from one
     /// review plan. This is a Git-ref reconstruction, never a local cache.
     pub fn stack_pull_requests_for_plan(
@@ -3291,6 +3314,7 @@ impl GitSemanticStore {
             };
             self.require_signature_quorum(&object, policy)?;
             let pull_request = self.get_stack_pull_request(&object)?;
+            self.verify_stack_pull_request_intent(&pull_request, policy)?;
             if pull_request.source_plan.as_ref() != Some(&plan.id)
                 || pull_request.source_plan_revision != plan.revision
             {
@@ -3334,6 +3358,7 @@ impl GitSemanticStore {
             };
             self.require_signature_quorum(&object, policy)?;
             let pull_request = self.get_stack_pull_request(&object)?;
+            self.verify_stack_pull_request_intent(&pull_request, policy)?;
             if pull_request.id != *id {
                 return Err(OrkiaError::Integrity(format!(
                     "stack pull request ref under {} points to stack pull request {}",
@@ -3373,6 +3398,7 @@ impl GitSemanticStore {
         };
         self.require_signature_quorum(&object, policy)?;
         let pull_request = self.get_stack_pull_request(&object)?;
+        self.verify_stack_pull_request_intent(&pull_request, policy)?;
         if pull_request.id != *id || pull_request.revision != revision {
             return Err(OrkiaError::Integrity(format!(
                 "stack pull request ref under {}/{} points to stack pull request {} revision {}",
