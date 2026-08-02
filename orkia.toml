@@ -1,0 +1,9 @@
+protected_branches = ["main"]
+validation_commands = []
+minimum_coverage_milli = 950
+minimum_confidence_milli = 800
+required_approvals = 1
+required_checks = ["orkia/integrate"]
+minimum_semantic_signatures = 1
+authorized_grant_issuers = []
+revoked_grants = []
