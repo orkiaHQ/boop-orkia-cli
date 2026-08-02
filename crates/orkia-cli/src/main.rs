@@ -172,6 +172,11 @@ enum SessionCommand {
 #[derive(Subcommand)]
 enum LedgerCommand {
     Verify,
+    /// Fetch the signed Orkia namespace through the configured Git remote.
+    Fetch {
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
 }
 #[derive(Subcommand)]
 enum ReviewCommand {
@@ -228,6 +233,19 @@ enum ReviewCommand {
 }
 #[derive(Subcommand)]
 enum ChangeSetCommand {
+    /// Discover the latest causally-related stack in each repository and
+    /// compose one signed multi-repository ChangeSet. Authors provide only
+    /// repository roots; stack and PR identities are derived from signed
+    /// session evidence and Git refs.
+    Auto {
+        /// Repository roots participating in the coordinated work. Every
+        /// repository must expose the same normalized captured objective.
+        #[arg(long = "repository-path", required = true)]
+        repository_path: Vec<PathBuf>,
+        /// IDs of ChangeSets that must be integrated before this one.
+        #[arg(long = "depends-on")]
+        depends_on: Vec<String>,
+    },
     /// Create and sign a multi-repository delivery ChangeSet. Each `--stack`
     /// is `<repository-uuid>:<stack-uuid>`.
     Create {
@@ -513,15 +531,24 @@ fn run(cli: Cli) -> Result<()> {
             handle_session(command, &git, &root, &secrets, &cli.repository)?
         }
         Command::Agent { command } => handle_agent(command, &git, &root, &secrets)?,
-        Command::Ledger {
-            command: LedgerCommand::Verify,
-        } => {
-            let actor: Actor = read_json(&root.join("orkia/actor.json"))?;
-            let events = git.ledger_store().read_all()?;
-            let actors = BTreeMap::from([(actor.id.clone(), actor)]);
-            verify_chain(&events, &actors)?;
-            println!("verified {} signed ledger events", events.len());
-        }
+        Command::Ledger { command } => match command {
+            LedgerCommand::Verify => {
+                let actor: Actor = read_json(&root.join("orkia/actor.json"))?;
+                let events = git.ledger_store().read_all()?;
+                let actors = BTreeMap::from([(actor.id.clone(), actor)]);
+                verify_chain(&events, &actors)?;
+                println!("verified {} signed ledger events", events.len());
+            }
+            LedgerCommand::Fetch { remote } => {
+                let policy = load_repository_policy(&cli.repository)?;
+                let verification = git.fetch_verified_orkia_refs(&remote, &policy)?;
+                println!(
+                    "fetched and verified {} semantic states, {} ledger events",
+                    verification.verified_states,
+                    git.ledger_store().read_all()?.len()
+                );
+            }
+        },
         Command::Review { command } => {
             handle_review(command, &git, &root, &cli.repository, &secrets)?
         }
@@ -1623,6 +1650,88 @@ fn handle_changeset(
 ) -> Result<()> {
     let policy = load_repository_policy(repository)?;
     match command {
+        ChangeSetCommand::Auto {
+            repository_path,
+            depends_on,
+        } => {
+            let (discovered, objective) = discover_causally_related_stacks(&repository_path)?;
+            let references = verify_referenced_stacks(
+                &discovered,
+                &repository_path
+                    .iter()
+                    .map(|path| {
+                        let root = git_dir(path)?;
+                        let id: RepositoryId = read_json(&root.join("orkia/repository.json"))?;
+                        Ok((id, path.clone()))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?,
+            )?;
+            let mut change_set = orkia_changesets::change_set_from_stack_references(references)?;
+            for dependency in depends_on {
+                let id = dependency
+                    .trim()
+                    .parse::<uuid::Uuid>()
+                    .map(ChangeSetId)
+                    .map_err(|error| {
+                        OrkiaError::Invalid(format!("invalid ChangeSet dependency: {error}"))
+                    })?;
+                orkia_changesets::add_changeset_dependency(&mut change_set, id)?;
+            }
+            for dependency in &change_set.depends_on {
+                let Some((_, dependency_changeset)) =
+                    git.semantic_store().latest_changeset(dependency, &policy)?
+                else {
+                    return Err(OrkiaError::NotFound(format!(
+                        "integrated ChangeSet dependency {}",
+                        dependency.0
+                    )));
+                };
+                if !matches!(
+                    dependency_changeset.status,
+                    orkia_model::StackPullRequestStatus::Integrated
+                ) {
+                    return Err(OrkiaError::Policy(format!(
+                        "ChangeSet dependency {} is not integrated",
+                        dependency.0
+                    )));
+                }
+            }
+            let identity = load_identity(root, secrets)?;
+            if let Some((_, current)) = git
+                .semantic_store()
+                .latest_changeset(&change_set.id, &policy)?
+                && current.stacks == change_set.stacks
+                && current.depends_on == change_set.depends_on
+                && current.status == change_set.status
+            {
+                println!(
+                    "changeset {} revision {} already automatically coordinated objective=`{}` repositories={}",
+                    current.id.0,
+                    current.revision,
+                    objective,
+                    current.stacks.len()
+                );
+                maybe_submit_changeset(&current, &identity)?;
+                return Ok(());
+            }
+            let object = git
+                .semantic_store()
+                .store_changeset(&change_set, &identity)?;
+            let ledger = open_repository_ledger(git, root, secrets)?;
+            ledger.append(CaptureEvent::ChangeSetPublished {
+                changeset: change_set.id.clone(),
+                revision: change_set.revision,
+                object,
+            })?;
+            maybe_submit_changeset(&change_set, &identity)?;
+            println!(
+                "changeset {} revision {} automatically coordinated objective=`{}` repositories={}",
+                change_set.id.0,
+                change_set.revision,
+                objective,
+                change_set.stacks.len()
+            );
+        }
         ChangeSetCommand::Create {
             stack,
             repository_path,
@@ -2026,6 +2135,159 @@ fn parse_changeset_repository_path(value: &str) -> Result<(RepositoryId, PathBuf
     Ok((repository, path))
 }
 
+/// Discovers one repository-local Stack per repository from signed refs and
+/// captured session objectives. This is the automatic composition boundary:
+/// callers never provide Stack IDs or PR order, and Orkia fails closed when
+/// the repositories do not share a causal objective.
+fn discover_causally_related_stacks(
+    repositories: &[PathBuf],
+) -> Result<(BTreeSet<ChangeSetStack>, String)> {
+    if repositories.len() < 2 {
+        return Err(OrkiaError::Invalid(
+            "automatic ChangeSet coordination needs at least two repositories".into(),
+        ));
+    }
+    #[derive(Clone)]
+    struct Candidate {
+        repository: RepositoryId,
+        stack: StackId,
+        revision: u32,
+        objective: String,
+        freshness: usize,
+    }
+    let mut candidates = Vec::new();
+    let mut seen_repositories = BTreeSet::new();
+    for path in repositories {
+        let root = git_dir(path)?;
+        let repository: RepositoryId = read_json(&root.join("orkia/repository.json"))?;
+        if !seen_repositories.insert(repository.clone()) {
+            return Err(OrkiaError::Invalid(format!(
+                "automatic ChangeSet coordination received repository {} twice",
+                repository.0
+            )));
+        }
+        let git = LibGit2Repository::open(path)?;
+        let policy = load_repository_policy(path)?;
+        let events = git.ledger_store().read_all()?;
+        let mut objectives = BTreeMap::new();
+        let mut plan_freshness = BTreeMap::new();
+        for (ordinal, event) in events.iter().enumerate() {
+            match &event.unsigned.event {
+                CaptureEvent::SessionStarted {
+                    session, objective, ..
+                } => {
+                    objectives.insert(session.clone(), normalize_coordination_objective(objective));
+                }
+                CaptureEvent::AgentAction {
+                    session: Some(session),
+                    action: orkia_model::AgentActionKind::Prompt { content },
+                    ..
+                } => {
+                    // The provider prompt is the durable intent signal. The
+                    // synthetic SessionStarted objective contains only the
+                    // external session ID and is therefore not useful for
+                    // correlating independent repositories.
+                    objectives.insert(session.clone(), normalize_coordination_objective(content));
+                }
+                CaptureEvent::ReviewPlanCreated { plan, .. } => {
+                    plan_freshness.insert(plan.clone(), ordinal);
+                }
+                _ => {}
+            }
+        }
+        let mut repository_candidates = Vec::new();
+        for stack in git.semantic_store().latest_stacks(&policy)? {
+            let Some((pull_request_id, pull_request_revision)) = stack
+                .pull_request_revisions
+                .iter()
+                .max_by_key(|(id, revision)| (**revision, (*id).clone()))
+            else {
+                continue;
+            };
+            let Some((_, pull_request)) = git.semantic_store().stack_pull_request_at_revision(
+                pull_request_id,
+                *pull_request_revision,
+                &policy,
+            )?
+            else {
+                continue;
+            };
+            let Some(objective) = objectives.get(&pull_request.session) else {
+                continue;
+            };
+            if objective.is_empty() {
+                continue;
+            }
+            repository_candidates.push(Candidate {
+                repository: repository.clone(),
+                stack: stack.id,
+                revision: stack.revision,
+                objective: objective.clone(),
+                freshness: pull_request
+                    .source_plan
+                    .as_ref()
+                    .and_then(|plan| plan_freshness.get(plan).copied())
+                    .unwrap_or_default(),
+            });
+        }
+        let Some(candidate) = repository_candidates.into_iter().max_by(|left, right| {
+            (left.freshness, left.revision, &left.stack).cmp(&(
+                right.freshness,
+                right.revision,
+                &right.stack,
+            ))
+        }) else {
+            return Err(OrkiaError::NotFound(format!(
+                "no causally captured Stack found in {}",
+                path.display()
+            )));
+        };
+        candidates.push(candidate);
+    }
+    let mut groups = BTreeMap::<String, Vec<Candidate>>::new();
+    for candidate in candidates {
+        groups
+            .entry(candidate.objective.clone())
+            .or_default()
+            .push(candidate);
+    }
+    let Some((objective, group)) =
+        groups
+            .into_iter()
+            .max_by(|(left_key, left), (right_key, right)| {
+                (left.len(), right_key).cmp(&(right.len(), left_key))
+            })
+    else {
+        return Err(OrkiaError::NotFound(
+            "no captured objectives available for automatic ChangeSet coordination".into(),
+        ));
+    };
+    if group.len() != repositories.len() {
+        return Err(OrkiaError::Policy(format!(
+            "automatic ChangeSet coordination requires one shared captured objective; found {}/{} repositories matching `{objective}`",
+            group.len(),
+            repositories.len()
+        )));
+    }
+    let references = group
+        .into_iter()
+        .map(|candidate| ChangeSetStack {
+            repository: candidate.repository,
+            stack: candidate.stack,
+            revision: candidate.revision,
+        })
+        .collect();
+    Ok((references, objective))
+}
+
+fn normalize_coordination_objective(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|part| part.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn verify_referenced_stacks(
     references: &BTreeSet<ChangeSetStack>,
     repository_paths: &BTreeMap<RepositoryId, PathBuf>,
@@ -2386,7 +2648,100 @@ fn persist_review_plan(
         coverage_milli: plan.coverage_milli,
     })?;
     maybe_submit_changeset(&change_set, &identity)?;
+    maybe_auto_project_and_publish(git, root, repository_path, secrets, &plan.id);
+    maybe_auto_coordinate_changeset(git, root, repository_path, secrets);
     Ok(())
+}
+
+/// Turns an automatically-created plan into a projected branch and, when the
+/// forge target is configured, publishes its PR without a second author
+/// command. Failures are retained as a deferred operation: capture and the
+/// signed plan remain durable and the next checkpoint retries the same plan.
+fn maybe_auto_project_and_publish(
+    git: &LibGit2Repository,
+    root: &Path,
+    repository: &Path,
+    secrets: &FileSecrets,
+    plan: &orkia_model::PlanId,
+) {
+    if std::env::var("ORKIA_AUTO_PROJECT").as_deref() != Ok("1") {
+        return;
+    }
+    let plan_id = plan.0.to_string();
+    if let Err(error) = handle_review(
+        ReviewCommand::Project {
+            plan: plan_id.clone(),
+        },
+        git,
+        root,
+        repository,
+        secrets,
+    ) {
+        eprintln!("automatic review projection deferred: {error}");
+        return;
+    }
+    let Ok(target) = std::env::var("ORKIA_AUTO_PUBLISH_GITHUB") else {
+        return;
+    };
+    let Some((github_owner, github_repository)) = target.split_once('/') else {
+        eprintln!(
+            "automatic forge publication deferred: ORKIA_AUTO_PUBLISH_GITHUB must be owner/repository"
+        );
+        return;
+    };
+    let base = std::env::var("ORKIA_AUTO_PUBLISH_BASE").unwrap_or_else(|_| "main".into());
+    let remote = std::env::var("ORKIA_AUTO_PUBLISH_REMOTE").unwrap_or_else(|_| "origin".into());
+    if let Err(error) = handle_review(
+        ReviewCommand::Publish {
+            plan: plan_id,
+            github_owner: github_owner.into(),
+            github_repository: github_repository.into(),
+            base,
+            remote,
+        },
+        git,
+        root,
+        repository,
+        secrets,
+    ) {
+        eprintln!("automatic forge publication deferred: {error}");
+    }
+}
+
+/// If a repository registry is configured, every automatic plan publication
+/// attempts to compose the latest causally-related stacks without requiring an
+/// author to name stacks or PRs. A repository that is not ready yet simply
+/// defers coordination; its local signed plan remains valid and the next
+/// checkpoint retries the deterministic composition.
+fn maybe_auto_coordinate_changeset(
+    git: &LibGit2Repository,
+    root: &Path,
+    repository: &Path,
+    secrets: &FileSecrets,
+) {
+    let Ok(raw_paths) = std::env::var("ORKIA_AUTO_COORDINATE_REPOSITORIES") else {
+        return;
+    };
+    let paths = raw_paths
+        .split(if cfg!(windows) { ';' } else { ':' })
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if paths.len() < 2 || !paths.iter().any(|path| path == repository) {
+        return;
+    }
+    if let Err(error) = handle_changeset(
+        ChangeSetCommand::Auto {
+            repository_path: paths,
+            depends_on: Vec::new(),
+        },
+        git,
+        root,
+        repository,
+        secrets,
+    ) {
+        eprintln!("automatic ChangeSet coordination deferred: {error}");
+    }
 }
 
 /// Submit the signed, content-free ChangeSet envelope when a backend is

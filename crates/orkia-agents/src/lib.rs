@@ -1383,7 +1383,23 @@ fn with_hooks(mut settings: Value, events: &[&str], entry: &Value) -> (Value, Ve
         let Some(entries) = event_entries(&mut settings, event) else {
             continue;
         };
-        if entries.iter().any(is_orkias) {
+        // Repeated bootstrap commands must converge to one Orkia handler per
+        // event. Older versions could leave duplicate marker entries behind;
+        // retain the first one and remove the rest while preserving hooks
+        // owned by other tools.
+        let mut seen = false;
+        entries.retain(|candidate| {
+            if !is_orkias(candidate) {
+                return true;
+            }
+            if seen {
+                false
+            } else {
+                seen = true;
+                true
+            }
+        });
+        if seen {
             continue;
         }
         entries.push(entry.clone());
@@ -1796,6 +1812,32 @@ mod tests {
         assert_eq!(
             removed,
             json!({"hooks":{"Stop":[{"matcher":"","hooks":[{"command":"other"}]}]}})
+        );
+    }
+
+    #[test]
+    fn repeated_install_deduplicates_existing_orkia_hooks() {
+        let value = json!({
+            "hooks": {
+                "Stop": [
+                    {"matcher":"","hooks":[{"command":"orkia agent hook # orkia hook"}]},
+                    {"matcher":"","hooks":[{"command":"other"}]},
+                    {"matcher":"","hooks":[{"command":"orkia agent hook # orkia hook"}]}
+                ]
+            }
+        });
+        let entry = json!({"matcher":"","hooks":[{"command":"orkia agent hook # orkia hook"}]});
+        let (after, added) = with_hooks(value, &["Stop"], &entry);
+        assert!(added.is_empty());
+        assert_eq!(after["hooks"]["Stop"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            after["hooks"]["Stop"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| is_orkias(entry))
+                .count(),
+            1
         );
     }
     #[test]

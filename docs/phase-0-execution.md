@@ -1,7 +1,8 @@
 # Phase 0 execution record
 
-Status: implementation complete for the local vertical slice. GitHub OAuth and
-real PR publication remain external acceptance gates.
+Status: Phase 0 acceptance scenario verified on 2026-08-01. The Ghost PR
+benchmark, production GitHub App deployment, Claude E2E, Sigstore publication
+and premium PR Shape remain later v0.1 gates.
 
 ## Repositories
 
@@ -70,16 +71,43 @@ of the frontend and CLI repositories. Their evidence is:
 - CLI: `orkia ledger verify` reported `19` signed events and
   `orkia review plan` reported one atom, one unit, coverage `1000‰`.
 
-## Remaining Phase 0 gates
+## Automatic cross-repository publication
 
-The signed CLI envelope path is exercised against the local backend and is
-idempotent (`idempotent: true` on replay, one database row). Three seeded local
-fixtures mapped to the real public GitHub repositories
-`boop-orkia-backend`, `boop-orkia-frontend`, and `boop-orkia-cli` each produced
-an automatic signed plan, stack, and ChangeSet; their canonical rows are
-visible in Postgres and via `/api/v1/changesets/{id}`.
+The reference scenario used three registered fresh clones and the same Codex
+prompt in each repository. No `orkia session start`, `changeset create`,
+`review project` or `review publish` command was issued. Stop hooks derived the
+plan, stack, projection, GitHub PR and ChangeSet automatically:
 
-The remaining acceptance gates require a real authenticated browser session:
-GitHub OAuth, projection of those ChangeSets into real GitHub PRs/checks, and a
-browser assertion of the canonical frontend card. Local credentials are
-configured for the server, but no browser login was performed in this run.
+- ChangeSet `999f94b1-6885-52a5-b9a0-de715426d297` contains exactly three stacks;
+- the backend API returned revision `0`, status `active`, and a payload with
+  exactly three `stacks` and three signed `proofs` with service authentication;
+- backend PR [#4](https://github.com/orkiaHQ/boop-orkia-backend/pull/4), frontend
+  PR [#6](https://github.com/orkiaHQ/boop-orkia-frontend/pull/6) and CLI PR
+  [#7](https://github.com/orkiaHQ/boop-orkia-cli/pull/7) were created by the
+  automatic publication path and all required CI jobs passed;
+- publication authentication used the configured GitHub installation token;
+  the local OAuth dashboard flow was also exercised against the running stack.
+
+The exact proof is retained in `docs/phase0-cross-repo-e2e.md`. GitHub rejects
+arbitrary custom refs under `refs/orkia/*`; Orkia transports immutable signed
+objects through `refs/tags/orkia-meta/*` and recreates canonical local refs on
+fetch. This remains ordinary Git object/ref transport.
+
+## Clone reconstruction
+
+Three new clones (`*-reconstruct`) ran `orkia init` and
+`orkia ledger fetch --remote origin`. The coordinator then reconstructed
+ChangeSet `999f94b1-6885-52a5-b9a0-de715426d297`: `orkia changeset show` returned
+three stacks and `orkia changeset status` over the three clones returned
+`ready_for_integration: true`, with all three stack PRs published and a
+deterministic execution order.
+
+The Git remote round-trip test covers this transport, including blob/tree
+semantic objects transported as lightweight tags.
+
+## Explicitly out of Phase 0
+
+Ghost PR causal thresholds (gain ≥20%, separated pairs <10%, ARI ≥0.8), a
+production GitHub App RS256/check-run run, Claude Code success, Sigstore
+signing and release binaries are later v0.1 gates documented in
+`orkia-unification-implementation-plan.md`.
