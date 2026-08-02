@@ -29,6 +29,9 @@ Verified on 2026-08-01:
 - The frontend builds with `npm ci` and `npm run build`; Vite serves the UI on
   `127.0.0.1:14173` with the backend endpoint configured.
 - CLI workspace tests pass (`15` tests) and the real CLI binary is built.
+- `scripts/e2e_server_changeset_status.sh` passes with a local service token:
+  the HTTP server reconstructs a signed ChangeSet from Git refs and returns
+  its execution order with `ready_for_integration: false` until projection.
 
 ## Real Codex capture
 
