@@ -2588,6 +2588,11 @@ fn persist_review_plan(
         Err(error) => return Err(error),
     }
     git.semantic_store().store_review_plan(plan, &identity)?;
+    // Automatic publication is itself a review checkpoint.  Capture the
+    // policy validations before deriving StackPullRequests so every durable
+    // unit carries the exact validation results that were available when it
+    // was published.  Integration re-runs them later as a separate gate.
+    let validations = run_validations(repository_path, &policy, ledger)?;
     let mut pull_requests = orkia_changesets::from_review_plan(
         plan,
         session.clone(),
@@ -2595,6 +2600,7 @@ fn persist_review_plan(
         base_commit.into(),
     )?;
     for pull_request in &mut pull_requests {
+        pull_request.validations = validations.clone();
         orkia_projection::bind_patches(pull_request, changes)?;
         if let Some((previous, current)) = git
             .semantic_store()
@@ -3678,6 +3684,25 @@ mod tests {
             !pull_requests[0].patches.is_empty(),
             "the authoritative stack pull request carries exact projection patches"
         );
+        assert_eq!(
+            pull_requests[0]
+                .validations
+                .iter()
+                .map(|validation| validation.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["git diff --check"],
+            "automatic StackPullRequests retain the checkpoint validation"
+        );
+        assert!(git.ledger_store().read_all().unwrap().iter().any(|event| {
+            matches!(
+                event.unsigned.event,
+                CaptureEvent::Validation {
+                    ref command,
+                    passed: true,
+                    ..
+                } if command == "git diff --check"
+            )
+        }));
         handle_review(
             ReviewCommand::Project {
                 plan: plan.id.0.to_string(),
