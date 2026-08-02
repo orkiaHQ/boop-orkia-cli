@@ -129,6 +129,11 @@ plan, stack, projection, GitHub PR and ChangeSet automatically:
 - The backend registry is bound to the real `orkiaHQ` namespace and GitHub
   repository IDs (`1319687696`, `1319687694`, `1319687699`), not the temporary
   `riftrHQ` seed namespace.
+- A follow-up signed submission (`b911426e-d43a-5480-83c5-6e1913733c5e`) was
+  reconstructed from the registered Git clones after the provenance-wire
+  hardening. The authenticated operations view rendered all three source
+  session IDs from its verified proofs; older records without those fields are
+  shown explicitly as `session unavailable` rather than being backfilled.
 
 The exact proof is retained in `docs/phase0-cross-repo-e2e.md`. GitHub rejects
 arbitrary custom refs under `refs/orkia/*`; Orkia transports immutable signed
